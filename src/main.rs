@@ -164,9 +164,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     StreamUrl::Direct(url) => url,
     StreamUrl::SignatureCipher(cipher) => {
       let stream = StreamUrl::SignatureCipher(cipher);
-      let script_url = StandardPlayerParser::player_script_url(&player_response)
-        .or(bootstrapper.player_script_url(&video_id).await?)
-        .ok_or("no player JavaScript URL was advertised")?;
+      let script_url = if let Some(url) = StandardPlayerParser::player_script_url(&player_response)
+      {
+        debug!("using player JavaScript URL from the player response");
+        Some(url)
+      } else {
+        debug!("player response did not advertise a JavaScript URL; fetching the watch page");
+        let url = bootstrapper.player_script_url(&video_id).await?;
+        if url.is_some() {
+          debug!("using player JavaScript URL from the watch page");
+        } else {
+          warn!("watch page did not advertise PLAYER_JS_URL for {video_id}");
+        }
+        url
+      };
+      let script_url = script_url.ok_or("no player JavaScript URL was advertised")?;
       BoaCipherResolver::new().resolve(&script_url, &stream).await?
     }
   };

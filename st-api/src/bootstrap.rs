@@ -4,7 +4,7 @@
 //! Innertube configuration and preserves anonymous cookies from that response.
 
 use crate::music::MusicClientConfig;
-use log::debug;
+use log::{debug, warn};
 use reqwest::{Client, header};
 use serde_json::{Map, Value};
 
@@ -99,6 +99,7 @@ impl WebBootstrapper {
     &self,
     video_id: &str,
   ) -> Result<Option<reqwest::Url>, BootstrapError> {
+    debug!("fetching YouTube Music watch page for player JavaScript (video {video_id})");
     let response = self
       .http
       .get("https://music.youtube.com/watch")
@@ -106,17 +107,22 @@ impl WebBootstrapper {
       .header(header::USER_AGENT, &self.user_agent)
       .send()
       .await
-      .map_err(BootstrapError::Request)?
-      .error_for_status()
       .map_err(BootstrapError::Request)?;
+    debug!("watch page response status={}", response.status());
+    let response = response.error_for_status().map_err(BootstrapError::Request)?;
     let html = response.text().await.map_err(BootstrapError::Request)?;
+    debug!("received YouTube Music watch page ({} bytes)", html.len());
     let config = extract_config(&html)?;
-    config
+    let script_url = config
       .get("PLAYER_JS_URL")
       .and_then(Value::as_str)
       .map(normalize_player_url)
       .transpose()
-      .map(|url| url.and_then(|url| reqwest::Url::parse(&url).ok()))
+      .map(|url| url.and_then(|url| reqwest::Url::parse(&url).ok()))?;
+    if script_url.is_none() {
+      warn!("watch-page ytcfg has no usable PLAYER_JS_URL");
+    }
+    Ok(script_url)
   }
 
   /// Parses HTML previously fetched from `https://music.youtube.com/`.
