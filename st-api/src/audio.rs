@@ -42,13 +42,11 @@ impl AudioClient {
   pub async fn request(&self, request: AudioRequest) -> reqwest::Result<Response> {
     let mut builder = self
       .client
-      .post(request.url)
+      .get(request.url)
       .header(header::USER_AGENT, &self.user_agent)
       .headers(request.headers)
       .header(header::ORIGIN, "https://music.youtube.com")
-      .header(header::REFERER, "https://music.youtube.com/")
-      // This is the small request body used by the captured player request.
-      .body(vec![b'x', 0]);
+      .header(header::REFERER, "https://music.youtube.com/");
 
     if let Some(byte_range) = request.byte_range {
       builder =

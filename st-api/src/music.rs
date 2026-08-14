@@ -40,6 +40,9 @@ impl Endpoint {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientContext {
+  /// Numeric client identifier used by the matching request header.
+  #[serde(skip)]
+  pub client_id:      u32,
   pub client_name:    String,
   pub client_version: String,
   pub hl:             String,
@@ -51,6 +54,7 @@ pub struct ClientContext {
 impl Default for ClientContext {
   fn default() -> Self {
     Self {
+      client_id:      67,
       client_name:    "WEB_REMIX".into(),
       // Deliberately configurable: this identifier changes frequently.
       client_version: "1.20260101.00.00".into(),
@@ -116,6 +120,8 @@ impl MusicClient {
       .http
       .post(url)
       .header(header::USER_AGENT, &self.config.user_agent)
+      .header("X-YouTube-Client-Name", self.config.context.client_id)
+      .header("X-YouTube-Client-Version", &self.config.context.client_version)
       .header(header::ORIGIN, "https://music.youtube.com")
       .header(header::REFERER, "https://music.youtube.com/")
       .headers(self.config.headers.clone())

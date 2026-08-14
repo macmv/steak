@@ -54,16 +54,102 @@ impl std::fmt::Display for PlayerError {
 
 impl std::error::Error for PlayerError {}
 
-/// Placeholder parser.
+/// Standard parser for the documented `streamingData.adaptiveFormats` shape.
 #[derive(Clone, Debug, Default)]
-pub struct UnimplementedPlayerParser;
+pub struct StandardPlayerParser;
 
-impl PlayerParser for UnimplementedPlayerParser {
-  fn audio_formats(&self, _: &serde_json::Value) -> Result<Vec<AudioFormat>, PlayerError> {
-    Err(PlayerError::NotImplemented)
+impl PlayerParser for StandardPlayerParser {
+  fn audio_formats(&self, response: &serde_json::Value) -> Result<Vec<AudioFormat>, PlayerError> {
+    if response.pointer("/playabilityStatus/status").and_then(serde_json::Value::as_str)
+      != Some("OK")
+    {
+      return Err(PlayerError::PlaybackUnavailable);
+    }
+    let formats = response
+      .pointer("/streamingData/adaptiveFormats")
+      .and_then(serde_json::Value::as_array)
+      .ok_or(PlayerError::NoAudioFormats)?;
+    let mut audio = Vec::new();
+    for format in formats {
+      let mime_type = format
+        .get("mimeType")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(PlayerError::InvalidFormat)?;
+      if !mime_type.starts_with("audio/") {
+        continue;
+      }
+      let itag = format
+        .get("itag")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| value.try_into().ok())
+        .ok_or(PlayerError::InvalidFormat)?;
+      let bitrate = format
+        .get("bitrate")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| value.try_into().ok())
+        .ok_or(PlayerError::InvalidFormat)?;
+      let content_length = match format.get("contentLength") {
+        Some(serde_json::Value::String(value)) => value.parse().ok(),
+        Some(value) => value.as_u64(),
+        None => None,
+      };
+      let stream_url = if let Some(url) = format.get("url").and_then(serde_json::Value::as_str) {
+        StreamUrl::Direct(reqwest::Url::parse(url).map_err(|_| PlayerError::InvalidFormat)?)
+      } else if let Some(cipher) = format
+        .get("signatureCipher")
+        .or_else(|| format.get("cipher"))
+        .and_then(serde_json::Value::as_str)
+      {
+        StreamUrl::SignatureCipher(cipher.into())
+      } else {
+        return Err(PlayerError::InvalidFormat);
+      };
+      audio.push(AudioFormat {
+        itag,
+        mime_type: mime_type.into(),
+        bitrate,
+        content_length,
+        stream_url,
+      });
+    }
+    if audio.is_empty() { Err(PlayerError::NoAudioFormats) } else { Ok(audio) }
   }
 
-  fn choose_audio(&self, _: Vec<AudioFormat>, _: AudioQuality) -> Result<AudioFormat, PlayerError> {
-    Err(PlayerError::NotImplemented)
+  fn choose_audio(
+    &self,
+    mut formats: Vec<AudioFormat>,
+    quality: AudioQuality,
+  ) -> Result<AudioFormat, PlayerError> {
+    if formats.is_empty() {
+      return Err(PlayerError::NoAudioFormats);
+    }
+    formats.sort_by_key(|format| format.bitrate);
+    let index = match quality {
+      AudioQuality::LowestBandwidth => 0,
+      AudioQuality::HighestBitrate => formats.len() - 1,
+      AudioQuality::Balanced => formats
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, format)| format.bitrate.abs_diff(160_000))
+        .map(|(index, _)| index)
+        .expect("formats is not empty"),
+    };
+    Ok(formats.swap_remove(index))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn extracts_audio_only_formats() {
+    let response = serde_json::json!({"playabilityStatus":{"status":"OK"},"streamingData":{"adaptiveFormats":[
+      {"itag": 251, "mimeType":"audio/webm; codecs=opus", "bitrate":160000, "contentLength":"42", "url":"https://example.test/audio"},
+      {"itag": 137, "mimeType":"video/mp4", "bitrate":400000, "url":"https://example.test/video"}
+    ]}});
+    let formats = StandardPlayerParser.audio_formats(&response).unwrap();
+    assert_eq!(formats.len(), 1);
+    assert_eq!(formats[0].content_length, Some(42));
   }
 }
