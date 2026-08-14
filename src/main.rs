@@ -1,6 +1,7 @@
 use std::{error::Error, process::Stdio};
 
 use bytes::Bytes;
+use clap::{Args, Parser, Subcommand};
 use futures_util::{Stream, StreamExt};
 use log::{debug, error, info, warn};
 use st_api::{
@@ -11,6 +12,40 @@ use st_api::{
   player::{AudioQuality, PlayerParser, StandardPlayerParser},
 };
 use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc};
+
+#[derive(Debug, Parser)]
+#[command(about = "Play a YouTube video's audio track")]
+struct Cli {
+  /// YouTube video ID to play.
+  #[arg(value_name = "YOUTUBE_VIDEO_ID")]
+  video_id: Option<String>,
+
+  #[command(subcommand)]
+  command: Option<CliCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+  /// Manage the authenticated YouTube session used for playback.
+  Auth(AuthCommand),
+}
+
+#[derive(Debug, Args)]
+struct AuthCommand {
+  #[command(subcommand)]
+  command: AuthSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthSubcommand {
+  /// Import YouTube cookies from a Firefox profile.
+  ImportFirefox {
+    /// Firefox profile directory containing cookies.sqlite.
+    firefox_profile: std::path::PathBuf,
+    /// Where to save the imported session (defaults to Steak's session path).
+    session_file:    Option<std::path::PathBuf>,
+  },
+}
 
 /// Plays a compressed audio byte stream through Linux's `ffplay` utility.
 ///
@@ -97,14 +132,16 @@ fn setup_logging() -> Result<(), log::SetLoggerError> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   setup_logging()?;
-  let args: Vec<_> = std::env::args_os().collect();
-  if args.get(1).and_then(|value| value.to_str()) == Some("auth") {
-    return auth_command(&args[2..]);
-  }
-  let video_id = match args.as_slice() {
-    [_, video_id] => video_id.to_string_lossy().into_owned(),
-    _ => return Err("usage: steak <youtube-video-id>".into()),
+  let cli = Cli::parse();
+  if let Some(CliCommand::Auth(auth)) = cli.command {
+    return match auth.command {
+      AuthSubcommand::ImportFirefox { firefox_profile, session_file } => {
+        auth_command(&firefox_profile, session_file)
+      }
+    };
   };
+  let video_id =
+    cli.video_id.ok_or("a YouTube video ID is required; run `steak --help` for usage")?;
   info!("starting playback request for YouTube video {video_id}");
 
   // The API key and client version change with the Music web app, so retrieve
@@ -137,14 +174,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   play(audio).await
 }
 
-fn auth_command(args: &[std::ffi::OsString]) -> Result<(), Box<dyn Error + Send + Sync>> {
-  if args.first().and_then(|value| value.to_str()) != Some("import-firefox")
-    || !(2..=3).contains(&args.len())
-  {
-    return Err("usage: steak auth import-firefox <firefox-profile> [session-file]".into());
-  }
-  let session = st_api::auth::import_firefox_profile(std::path::Path::new(&args[1]))?;
-  let output = args.get(2).map(std::path::PathBuf::from).unwrap_or_else(st_api::auth::session_path);
+fn auth_command(
+  firefox_profile: &std::path::Path,
+  output: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+  let session = st_api::auth::import_firefox_profile(firefox_profile)?;
+  let output = output.unwrap_or_else(st_api::auth::session_path);
   session.save(&output)?;
   eprintln!("Imported YouTube session to {}. Keep it private.", output.display());
   Ok(())
