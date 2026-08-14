@@ -5,7 +5,7 @@
 //! regularly, so keep this logic replaceable and fixture-tested.
 
 use boa_engine::{Context, Source};
-use regex::Regex;
+use log::{debug, warn};
 use reqwest::{Client, Url};
 use serde_json::to_string;
 
@@ -80,37 +80,79 @@ impl BoaCipherResolver {
     player_script_url: &Url,
     stream: &StreamUrl,
   ) -> Result<Url, CipherError> {
-    let script = self
+    debug!(
+      "fetching player JavaScript from host {:?}, path {}",
+      player_script_url.host_str(),
+      player_script_url.path()
+    );
+    let response = self
       .http
       .get(player_script_url.clone())
       .send()
       .await
-      .map_err(|error| CipherError::JavaScript(error.to_string()))?
+      .map_err(|error| CipherError::JavaScript(error.to_string()))?;
+    debug!("player JavaScript response status={}", response.status());
+    let script = response
       .error_for_status()
       .map_err(|error| CipherError::JavaScript(error.to_string()))?
       .text()
       .await
       .map_err(|error| CipherError::JavaScript(error.to_string()))?;
+    debug!("downloaded player JavaScript ({} bytes)", script.len());
     self.resolve_script(&script, stream)
   }
 
   pub fn resolve_script(&self, script: &str, stream: &StreamUrl) -> Result<Url, CipherError> {
+    log::debug!(
+      "evaluating player script: bytes={}, split={}, join={}, function={}",
+      script.len(),
+      script.contains(".split"),
+      script.contains(".join"),
+      script.contains("function"),
+    );
     match stream {
       StreamUrl::Direct(url) => Ok(url.clone()),
       StreamUrl::SignatureCipher(cipher) => {
         let form = Url::parse(&format!("https://cipher.invalid/?{cipher}"))
           .map_err(|_| CipherError::InvalidUrl)?;
         let fields: std::collections::HashMap<_, _> = form.query_pairs().into_owned().collect();
+        debug!(
+          "resolving signature cipher; fields: url={}, sig={}, s={}, sp={}",
+          fields.contains_key("url"),
+          fields.contains_key("sig") || fields.contains_key("signature"),
+          fields.contains_key("s"),
+          fields.contains_key("sp"),
+        );
         let mut url = Url::parse(fields.get("url").ok_or(CipherError::InvalidUrl)?)
           .map_err(|_| CipherError::InvalidUrl)?;
         if let Some(signature) = fields.get("sig").or_else(|| fields.get("signature")) {
+          debug!("signature cipher already has a signature; no JavaScript transformation needed");
           let parameter = fields.get("sp").map(String::as_str).unwrap_or("signature");
           url.query_pairs_mut().append_pair(parameter, signature);
           return Ok(url);
         }
         let encrypted = fields.get("s").ok_or(CipherError::MissingSignature)?;
-        let function = extract_signature_function(script).ok_or(CipherError::MissingFunction)?;
+        let function = match extract_signature_function(script) {
+          Some(function) => {
+            debug!("extracted a {}-byte signature transformation function", function.len());
+            function
+          }
+          None => {
+            warn!(
+              "no supported signature transformation was found in player JavaScript ({} bytes; function={}, split={}, join={})",
+              script.len(),
+              script.contains("function"),
+              script.contains(".split("),
+              script.contains(".join("),
+            );
+            return Err(CipherError::MissingFunction);
+          }
+        };
         let signature = evaluate_signature(function, encrypted)?;
+        debug!(
+          "signature transformation evaluated successfully ({} output bytes)",
+          signature.len()
+        );
         let parameter = fields.get("sp").map(String::as_str).unwrap_or("signature");
         url.query_pairs_mut().append_pair(parameter, &signature);
         Ok(url)
@@ -122,10 +164,54 @@ impl BoaCipherResolver {
 /// Extracts the common unary split/transform/join signature function shape.
 /// This intentionally fails closed when the player deploys a different shape.
 pub fn extract_signature_function(script: &str) -> Option<&str> {
-  // The body is bounded by the first closing brace after the join. This covers
-  // the usual YouTube helper while avoiding attempting to parse all minified JS.
-  let pattern = Regex::new(r#"(?s)function\s*(?:[$\w]+\s*)?\(\s*[$\w]+\s*\)\s*\{[^{}]*?\.split\(\s*[\"']\s*[\"']\s*\)[^{}]*?\.join\(\s*[\"']\s*[\"']\s*\)[^{}]*?\}"#).ok()?;
-  pattern.find(script).map(|matched| matched.as_str())
+  let mut offset = 0;
+  while let Some(split_offset) = script[offset..].find(".split") {
+    let split_offset = offset + split_offset;
+    let function_start = script[..split_offset].rfind("function")?;
+    let open_brace = script[function_start..].find('{')? + function_start;
+    let close_brace = matching_brace(script, open_brace)?;
+    let candidate = &script[function_start..=close_brace];
+    if candidate.contains(".join") {
+      return Some(candidate);
+    }
+    offset = split_offset + ".split".len();
+  }
+  None
+}
+
+fn matching_brace(script: &str, open: usize) -> Option<usize> {
+  let bytes = script.as_bytes();
+  let mut depth = 0_u32;
+  let mut quote = None;
+  let mut escaped = false;
+  for (index, byte) in bytes.iter().enumerate().skip(open) {
+    if let Some(current) = quote {
+      if escaped {
+        escaped = false;
+        continue;
+      }
+      if *byte == b'\\' {
+        escaped = true;
+        continue;
+      }
+      if *byte == current {
+        quote = None;
+      }
+      continue;
+    }
+    match *byte {
+      b'\'' | b'"' | b'`' => quote = Some(*byte),
+      b'{' => depth += 1,
+      b'}' => {
+        depth = depth.checked_sub(1)?;
+        if depth == 0 {
+          return Some(index);
+        }
+      }
+      _ => {}
+    }
+  }
+  None
 }
 
 impl std::error::Error for CipherError {}

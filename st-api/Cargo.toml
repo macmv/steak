@@ -12,7 +12,6 @@ serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha1 = "0.10"
 boa_engine = "0.20"
-regex = "1"
 log = "0.4.33"
 
 [dev-dependencies]
