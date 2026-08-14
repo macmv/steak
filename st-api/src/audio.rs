@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use futures_core::Stream;
+use log::debug;
 use reqwest::{Client, Response, StatusCode, Url, header};
 
 /// Inputs for an audio request.
@@ -40,6 +41,11 @@ impl AudioClient {
   /// Use [`Self::stream`] when only the body stream is needed. The caller must
   /// retain/use the response status and headers if it needs range metadata.
   pub async fn request(&self, request: AudioRequest) -> reqwest::Result<Response> {
+    debug!(
+      "requesting audio from host {:?}, byte range {:?}",
+      request.url.host_str(),
+      request.byte_range
+    );
     let mut builder = self
       .client
       .get(request.url)
@@ -52,7 +58,13 @@ impl AudioClient {
       builder =
         builder.header(header::RANGE, format!("bytes={}-{}", byte_range.start(), byte_range.end()));
     }
-    builder.send().await
+    let response = builder.send().await?;
+    debug!(
+      "audio response status={}, content-length={:?}",
+      response.status(),
+      response.content_length()
+    );
+    Ok(response)
   }
 
   /// Sends an audio request and yields body chunks as they arrive.

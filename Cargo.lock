@@ -120,6 +120,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fern"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4316185f709b23713e41e3195f90edef7fb00c3ed4adc79769cf09cc762a3b29"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -876,6 +885,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures-core",
+ "log",
  "reqwest",
  "rusqlite",
  "serde",
@@ -894,7 +904,9 @@ name = "steak"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "fern",
  "futures-util",
+ "log",
  "st-api",
  "tokio",
 ]

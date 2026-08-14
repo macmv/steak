@@ -2,6 +2,7 @@ use std::{error::Error, process::Stdio};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
+use log::{debug, error, info, warn};
 use st_api::{
   audio::{AudioClient, AudioRequest},
   bootstrap::{Bootstrapper, WebBootstrapper},
@@ -30,24 +31,38 @@ where
   // behind, `send` waits once this buffer is full and applies backpressure.
   let (sender, mut chunks) = mpsc::channel::<Result<Bytes, E>>(64);
   let fetch_task = tokio::spawn(async move {
+    debug!("audio fetch task started");
     futures_util::pin_mut!(audio);
     while let Some(chunk) = audio.next().await {
+      match &chunk {
+        Ok(bytes) => debug!("fetched {} encoded audio bytes", bytes.len()),
+        Err(_) => warn!("audio fetch task received a stream error"),
+      }
       if sender.send(chunk).await.is_err() {
+        debug!("playback receiver closed; stopping audio fetch");
         break; // Playback ended, so stop downloading.
       }
     }
+    debug!("audio fetch task finished");
   });
 
+  debug!("starting ffplay process");
   let mut player = Command::new("ffplay")
     .args(["-nodisp", "-autoexit", "-loglevel", "error", "-i", "pipe:0"])
     .stdin(Stdio::piped())
     .spawn()?;
   let mut stdin = player.stdin.take().expect("ffplay stdin was piped");
+  let mut played_bytes = 0_u64;
 
   while let Some(chunk) = chunks.recv().await {
     match chunk {
-      Ok(chunk) => stdin.write_all(&chunk).await?,
+      Ok(chunk) => {
+        played_bytes += chunk.len() as u64;
+        debug!("writing {} bytes to ffplay ({} total)", chunk.len(), played_bytes);
+        stdin.write_all(&chunk).await?;
+      }
       Err(error) => {
+        error!("audio stream failed: {error}");
         let _ = player.kill().await;
         let _ = fetch_task.await;
         return Err(error.into());
@@ -57,37 +72,55 @@ where
   drop(stdin); // EOF tells ffplay there are no more encoded bytes.
 
   fetch_task.await?;
-  if !player.wait().await?.success() {
+  let status = player.wait().await?;
+  debug!("ffplay exited with {status} after receiving {played_bytes} bytes");
+  if !status.success() {
     return Err("ffplay exited unsuccessfully".into());
   }
   Ok(())
 }
 
+fn setup_logging() -> Result<(), log::SetLoggerError> {
+  let level = std::env::var("RUST_LOG")
+    .ok()
+    .and_then(|value| value.parse().ok())
+    .unwrap_or(log::LevelFilter::Debug);
+  fern::Dispatch::new()
+    .level(level)
+    .format(|out, message, record| {
+      out.finish(format_args!("[{} {}] {message}", record.level(), record.target()))
+    })
+    .chain(std::io::stderr())
+    .apply()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+  setup_logging()?;
   let args: Vec<_> = std::env::args_os().collect();
   if args.get(1).and_then(|value| value.to_str()) == Some("auth") {
     return auth_command(&args[2..]);
   }
   let (video_id, session_path) = match args.as_slice() {
-    [_, video_id] => (video_id.to_string_lossy().into_owned(), None),
+    [_, video_id] => (video_id.to_string_lossy().into_owned(), st_api::auth::session_path()),
     [_, flag, path, video_id] if flag == "--session" => {
-      (video_id.to_string_lossy().into_owned(), Some(std::path::PathBuf::from(path)))
+      (video_id.to_string_lossy().into_owned(), std::path::PathBuf::from(path))
     }
     _ => return Err("usage: steak [--session <session-file>] <youtube-video-id>".into()),
   };
+  info!("starting playback request for YouTube video {video_id}");
 
   // The API key and client version change with the Music web app, so retrieve
   // them rather than baking a stale value into the executable.
   let bootstrap = WebBootstrapper::default().bootstrap().await?;
+  debug!("received current YouTube Music client configuration");
   let mut config = MusicClientConfig::default();
   bootstrap.apply_to(&mut config);
-  if let Some(path) = session_path {
-    let session = st_api::auth::StoredSession::load(&path)?;
-    config.headers.extend(session.auth_session().request_headers());
-  }
+  let session = st_api::auth::StoredSession::load(&session_path)?;
+  config.headers.extend(session.auth_session().request_headers());
 
   let player_response = MusicClient::new(config).player(&video_id).await?;
+  debug!("received player response for {video_id}");
   let parser = StandardPlayerParser;
   let format =
     parser.choose_audio(parser.audio_formats(&player_response)?, AudioQuality::Balanced)?;
@@ -102,17 +135,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
   };
 
-  eprintln!("playing {video_id}: {} at {} bps", format.mime_type, format.bitrate);
+  info!("playing {video_id}: {} at {} bps", format.mime_type, format.bitrate);
   let audio = AudioClient::default().stream(AudioRequest::new(stream_url)).await?;
   play(audio).await
 }
 
 fn auth_command(args: &[std::ffi::OsString]) -> Result<(), Box<dyn Error + Send + Sync>> {
-  if args.first().and_then(|value| value.to_str()) != Some("import-firefox") || args.len() != 3 {
-    return Err("usage: steak auth import-firefox <firefox-profile> <session-file>".into());
+  if args.first().and_then(|value| value.to_str()) != Some("import-firefox")
+    || !(2..=3).contains(&args.len())
+  {
+    return Err("usage: steak auth import-firefox <firefox-profile> [session-file]".into());
   }
   let session = st_api::auth::import_firefox_profile(std::path::Path::new(&args[1]))?;
-  session.save(std::path::Path::new(&args[2]))?;
-  eprintln!("Imported YouTube session. Keep the session file private.");
+  let output = args.get(2).map(std::path::PathBuf::from).unwrap_or_else(st_api::auth::session_path);
+  session.save(&output)?;
+  eprintln!("Imported YouTube session to {}. Keep it private.", output.display());
   Ok(())
 }

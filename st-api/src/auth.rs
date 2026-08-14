@@ -13,6 +13,14 @@ use reqwest::header::HeaderMap;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+/// The conventional local session-file location used by the CLI and tests.
+pub fn session_path() -> PathBuf {
+  std::env::var_os("HOME")
+    .map(PathBuf::from)
+    .unwrap_or_else(|| PathBuf::from("."))
+    .join(".config/steak/session.json")
+}
+
 /// Authentication material for a single request origin.
 #[derive(Clone, Debug, Default)]
 pub struct AuthSession {

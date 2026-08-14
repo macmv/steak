@@ -4,6 +4,7 @@
 //! authentication, player-response deciphering, and conversion from renderer
 //! trees into application models intentionally belong in higher layers.
 
+use log::debug;
 use reqwest::{Client, Url, header};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -123,6 +124,7 @@ impl MusicClient {
     endpoint: Endpoint,
     payload: Map<String, Value>,
   ) -> reqwest::Result<Value> {
+    debug!("calling YouTube Music Innertube endpoint {}", endpoint.path());
     self.call_with_context(endpoint, payload, Map::new()).await
   }
 
@@ -169,7 +171,9 @@ impl MusicClient {
     if let Some(visitor_data) = &self.config.context.visitor_data {
       request = request.header("X-Goog-Visitor-Id", visitor_data);
     }
-    request.send().await?.error_for_status()?.json().await
+    let response = request.send().await?;
+    debug!("Innertube {} responded with {}", endpoint.path(), response.status());
+    response.error_for_status()?.json().await
   }
 
   pub async fn search(

@@ -4,6 +4,7 @@
 //! Innertube configuration and preserves anonymous cookies from that response.
 
 use crate::music::MusicClientConfig;
+use log::debug;
 use reqwest::{Client, header};
 use serde_json::{Map, Value};
 
@@ -130,6 +131,7 @@ impl Bootstrapper for WebBootstrapper {
     &self,
   ) -> impl std::future::Future<Output = Result<BootstrapData, BootstrapError>> + Send {
     async move {
+      debug!("fetching YouTube Music bootstrap page");
       let response = self
         .http
         .get("https://music.youtube.com/")
@@ -142,6 +144,7 @@ impl Bootstrapper for WebBootstrapper {
         .map_err(BootstrapError::Request)?;
       let cookies = response_cookies(response.headers());
       let html = response.text().await.map_err(BootstrapError::Request)?;
+      debug!("received YouTube Music bootstrap page ({} bytes)", html.len());
       let mut data = Self::parse(&html)?;
       data.cookies = cookies;
       Ok(data)

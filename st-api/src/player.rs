@@ -1,6 +1,7 @@
 //! Player-response and audio-format data contracts.
 
 use crate::cipher::StreamUrl;
+use log::{debug, warn};
 
 /// The selected audio stream, ready for cipher resolution and playback.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,9 +61,19 @@ pub struct StandardPlayerParser;
 
 impl PlayerParser for StandardPlayerParser {
   fn audio_formats(&self, response: &serde_json::Value) -> Result<Vec<AudioFormat>, PlayerError> {
-    if response.pointer("/playabilityStatus/status").and_then(serde_json::Value::as_str)
-      != Some("OK")
-    {
+    let status = response.pointer("/playabilityStatus/status").and_then(serde_json::Value::as_str);
+    if status != Some("OK") {
+      // This usually explains whether the video is private, age/region
+      // restricted, requires login, or simply has no playback entitlement.
+      warn!(
+        "YouTube playback is unavailable: status={:?}, reason={:?}",
+        status,
+        response.pointer("/playabilityStatus/reason").and_then(serde_json::Value::as_str),
+      );
+      debug!(
+        "full YouTube playability status: {}",
+        response.pointer("/playabilityStatus").unwrap_or(&serde_json::Value::Null),
+      );
       return Err(PlayerError::PlaybackUnavailable);
     }
     let formats = response
@@ -112,6 +123,7 @@ impl PlayerParser for StandardPlayerParser {
         stream_url,
       });
     }
+    debug!("extracted {} audio-only player formats", audio.len());
     if audio.is_empty() { Err(PlayerError::NoAudioFormats) } else { Ok(audio) }
   }
 
@@ -134,7 +146,12 @@ impl PlayerParser for StandardPlayerParser {
         .map(|(index, _)| index)
         .expect("formats is not empty"),
     };
-    Ok(formats.swap_remove(index))
+    let selected = formats.swap_remove(index);
+    debug!(
+      "selected audio format itag={}, mime={}, bitrate={}",
+      selected.itag, selected.mime_type, selected.bitrate
+    );
+    Ok(selected)
   }
 }
 
