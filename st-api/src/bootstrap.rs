@@ -112,13 +112,13 @@ impl WebBootstrapper {
     let response = response.error_for_status().map_err(BootstrapError::Request)?;
     let html = response.text().await.map_err(BootstrapError::Request)?;
     debug!("received YouTube Music watch page ({} bytes)", html.len());
-    let config = extract_config(&html)?;
-    let script_url = config
-      .get("PLAYER_JS_URL")
-      .and_then(Value::as_str)
-      .map(normalize_player_url)
-      .transpose()
-      .map(|url| url.and_then(|url| reqwest::Url::parse(&url).ok()))?;
+    let script_url = embedded_string_field(&html, "PLAYER_JS_URL")
+      .or_else(|| embedded_string_field(&html, "JS_URL"))
+      .or_else(|| player_path_in_html(&html))
+      .map(|value| normalize_player_url(&value))
+      .transpose()?
+      .map(|url| reqwest::Url::parse(&url).map_err(|_| BootstrapError::InvalidConfig))
+      .transpose()?;
     if script_url.is_none() {
       warn!("watch-page ytcfg has no usable PLAYER_JS_URL");
     }
@@ -208,9 +208,33 @@ fn normalize_player_url(value: &str) -> Result<String, BootstrapError> {
     return Ok(value.into());
   }
   if value.starts_with('/') {
-    return Ok(format!("https://music.youtube.com{value}"));
+    return Ok(format!("https://www.youtube.com{value}"));
   }
   Err(BootstrapError::InvalidConfig)
+}
+
+fn embedded_string_field(html: &str, field: &str) -> Option<String> {
+  let marker = "ytcfg.set(";
+  let mut remainder = html;
+  while let Some(offset) = remainder.find(marker) {
+    let after_marker = &remainder[offset + marker.len()..];
+    if let Some(object) = balanced_object(after_marker) {
+      if let Ok(config) = serde_json::from_str::<Value>(object) {
+        if let Some(value) = config.get(field).and_then(Value::as_str) {
+          return Some(value.to_owned());
+        }
+      }
+    }
+    remainder = after_marker;
+  }
+  None
+}
+
+fn player_path_in_html(html: &str) -> Option<String> {
+  let start = html.find("/s/player/")?;
+  let tail = &html[start..];
+  let end = tail.find(|character: char| matches!(character, '"' | '\'' | '\\' | '?' | '#'))?;
+  Some(tail[..end].to_owned())
 }
 
 fn extract_config(html: &str) -> Result<Value, BootstrapError> {
@@ -272,7 +296,7 @@ mod tests {
     assert_eq!(data.client_version, "1.2");
     assert_eq!(
       data.player_script_url.as_deref(),
-      Some("https://music.youtube.com/s/player/a/base.js")
+      Some("https://www.youtube.com/s/player/a/base.js")
     );
   }
 }
