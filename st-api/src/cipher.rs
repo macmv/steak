@@ -5,7 +5,8 @@
 //! regularly, so keep this logic replaceable and fixture-tested.
 
 use boa_engine::{Context, Source};
-use reqwest::Url;
+use regex::Regex;
+use reqwest::{Client, Url};
 use serde_json::to_string;
 
 /// A URL embedded in a player response before any deciphering.
@@ -27,6 +28,7 @@ pub enum CipherError {
   InvalidUrl,
   PlayerScriptChanged,
   JavaScript(String),
+  MissingFunction,
 }
 
 impl std::fmt::Display for CipherError {
@@ -39,6 +41,9 @@ impl std::fmt::Display for CipherError {
       Self::InvalidUrl => f.write_str("cipher payload contains an invalid URL"),
       Self::PlayerScriptChanged => f.write_str("player script extraction no longer matches"),
       Self::JavaScript(error) => write!(f, "player cipher JavaScript failed: {error}"),
+      Self::MissingFunction => {
+        f.write_str("could not find a signature function in player JavaScript")
+      }
     }
   }
 }
@@ -59,6 +64,68 @@ pub fn evaluate_signature(function_expression: &str, input: &str) -> Result<Stri
     .to_string(&mut context)
     .map(|value| value.to_std_string_escaped())
     .map_err(|error| CipherError::JavaScript(error.to_string()))
+}
+
+/// Fetches a player script and resolves a `signatureCipher` URL with Boa.
+#[derive(Clone, Debug, Default)]
+pub struct BoaCipherResolver {
+  http: Client,
+}
+
+impl BoaCipherResolver {
+  pub fn new() -> Self { Self { http: Client::new() } }
+
+  pub async fn resolve(
+    &self,
+    player_script_url: &Url,
+    stream: &StreamUrl,
+  ) -> Result<Url, CipherError> {
+    let script = self
+      .http
+      .get(player_script_url.clone())
+      .send()
+      .await
+      .map_err(|error| CipherError::JavaScript(error.to_string()))?
+      .error_for_status()
+      .map_err(|error| CipherError::JavaScript(error.to_string()))?
+      .text()
+      .await
+      .map_err(|error| CipherError::JavaScript(error.to_string()))?;
+    self.resolve_script(&script, stream)
+  }
+
+  pub fn resolve_script(&self, script: &str, stream: &StreamUrl) -> Result<Url, CipherError> {
+    match stream {
+      StreamUrl::Direct(url) => Ok(url.clone()),
+      StreamUrl::SignatureCipher(cipher) => {
+        let form = Url::parse(&format!("https://cipher.invalid/?{cipher}"))
+          .map_err(|_| CipherError::InvalidUrl)?;
+        let fields: std::collections::HashMap<_, _> = form.query_pairs().into_owned().collect();
+        let mut url = Url::parse(fields.get("url").ok_or(CipherError::InvalidUrl)?)
+          .map_err(|_| CipherError::InvalidUrl)?;
+        if let Some(signature) = fields.get("sig").or_else(|| fields.get("signature")) {
+          let parameter = fields.get("sp").map(String::as_str).unwrap_or("signature");
+          url.query_pairs_mut().append_pair(parameter, signature);
+          return Ok(url);
+        }
+        let encrypted = fields.get("s").ok_or(CipherError::MissingSignature)?;
+        let function = extract_signature_function(script).ok_or(CipherError::MissingFunction)?;
+        let signature = evaluate_signature(function, encrypted)?;
+        let parameter = fields.get("sp").map(String::as_str).unwrap_or("signature");
+        url.query_pairs_mut().append_pair(parameter, &signature);
+        Ok(url)
+      }
+    }
+  }
+}
+
+/// Extracts the common unary split/transform/join signature function shape.
+/// This intentionally fails closed when the player deploys a different shape.
+pub fn extract_signature_function(script: &str) -> Option<&str> {
+  // The body is bounded by the first closing brace after the join. This covers
+  // the usual YouTube helper while avoiding attempting to parse all minified JS.
+  let pattern = Regex::new(r#"(?s)function\s*(?:[$\w]+\s*)?\(\s*[$\w]+\s*\)\s*\{[^{}]*?\.split\(\s*[\"']\s*[\"']\s*\)[^{}]*?\.join\(\s*[\"']\s*[\"']\s*\)[^{}]*?\}"#).ok()?;
+  pattern.find(script).map(|matched| matched.as_str())
 }
 
 impl std::error::Error for CipherError {}
@@ -105,5 +172,12 @@ mod tests {
     )
     .unwrap();
     assert_eq!(output, "fedcba");
+  }
+
+  #[test]
+  fn extracts_common_signature_function() {
+    let script = r#"var x=function(a){a=a.split("");a.reverse();return a.join("")};"#;
+    let function = extract_signature_function(script).unwrap();
+    assert_eq!(evaluate_signature(function, "abc").unwrap(), "cba");
   }
 }

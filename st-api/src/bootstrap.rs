@@ -93,6 +93,32 @@ impl WebBootstrapper {
     Self { http, user_agent }
   }
 
+  /// Fetches a watch page when the player response does not carry its script
+  /// URL.
+  pub async fn player_script_url(
+    &self,
+    video_id: &str,
+  ) -> Result<Option<reqwest::Url>, BootstrapError> {
+    let response = self
+      .http
+      .get("https://music.youtube.com/watch")
+      .query(&[("v", video_id)])
+      .header(header::USER_AGENT, &self.user_agent)
+      .send()
+      .await
+      .map_err(BootstrapError::Request)?
+      .error_for_status()
+      .map_err(BootstrapError::Request)?;
+    let html = response.text().await.map_err(BootstrapError::Request)?;
+    let config = extract_config(&html)?;
+    config
+      .get("PLAYER_JS_URL")
+      .and_then(Value::as_str)
+      .map(normalize_player_url)
+      .transpose()
+      .map(|url| url.and_then(|url| reqwest::Url::parse(&url).ok()))
+  }
+
   /// Parses HTML previously fetched from `https://music.youtube.com/`.
   pub fn parse(html: &str) -> Result<BootstrapData, BootstrapError> {
     let config = extract_config(html)?;

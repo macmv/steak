@@ -7,7 +7,7 @@ use log::{debug, error, info, warn};
 use st_api::{
   audio::{AudioClient, AudioRequest},
   bootstrap::{Bootstrapper, WebBootstrapper},
-  cipher::StreamUrl,
+  cipher::{BoaCipherResolver, StreamUrl},
   music::{MusicClient, MusicClientConfig},
   player::{AudioQuality, PlayerParser, StandardPlayerParser},
 };
@@ -146,7 +146,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
   // The API key and client version change with the Music web app, so retrieve
   // them rather than baking a stale value into the executable.
-  let bootstrap = WebBootstrapper::default().bootstrap().await?;
+  let bootstrapper = WebBootstrapper::default();
+  let bootstrap = bootstrapper.bootstrap().await?;
   debug!("received current YouTube Music client configuration");
   let mut config = MusicClientConfig::default();
   bootstrap.apply_to(&mut config);
@@ -161,11 +162,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   let stream_url = match format.stream_url {
     // Direct URLs are short-lived, authorized media URLs returned by YouTube.
     StreamUrl::Direct(url) => url,
-    StreamUrl::SignatureCipher(_) => {
-      return Err(
-        "YouTube returned a ciphered media URL; player-script deciphering is not wired up yet"
-          .into(),
-      );
+    StreamUrl::SignatureCipher(cipher) => {
+      let stream = StreamUrl::SignatureCipher(cipher);
+      let script_url = StandardPlayerParser::player_script_url(&player_response)
+        .or(bootstrapper.player_script_url(&video_id).await?)
+        .ok_or("no player JavaScript URL was advertised")?;
+      BoaCipherResolver::new().resolve(&script_url, &stream).await?
     }
   };
 

@@ -6,7 +6,7 @@ use st_api::{
   auth::{StoredSession, session_path},
   bootstrap::{Bootstrapper, WebBootstrapper},
   catalog::SearchParser,
-  cipher::StreamUrl,
+  cipher::{BoaCipherResolver, StreamUrl},
   music::{MusicClient, MusicClientConfig},
   player::{AudioQuality, PlayerParser, StandardPlayerParser},
 };
@@ -17,7 +17,8 @@ async fn search_result_has_an_audio_format_in_its_player_response() {
   let session_path = session_path();
   let session = StoredSession::load(&session_path)
     .expect("run `steak auth import-firefox` before this live test");
-  let bootstrap = WebBootstrapper::default().bootstrap().await.unwrap();
+  let bootstrapper = WebBootstrapper::default();
+  let bootstrap = bootstrapper.bootstrap().await.unwrap();
   let mut config = MusicClientConfig::default();
   bootstrap.apply_to(&mut config);
   config.headers.extend(session.auth_session().request_headers());
@@ -49,4 +50,12 @@ async fn search_result_has_an_audio_format_in_its_player_response() {
       StreamUrl::SignatureCipher(_) => "signature cipher",
     }
   );
+  if let StreamUrl::SignatureCipher(_) = &selected.stream_url {
+    let script_url = StandardPlayerParser::player_script_url(&player)
+      .or(bootstrapper.player_script_url(&track.video_id).await.unwrap())
+      .expect("watch page must advertise its JavaScript URL for ciphered formats");
+    let resolved =
+      BoaCipherResolver::new().resolve(&script_url, &selected.stream_url).await.unwrap();
+    assert!(resolved.query_pairs().any(|(key, _)| key == "signature" || key == "sig"));
+  }
 }
