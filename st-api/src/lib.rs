@@ -7,6 +7,7 @@
 pub mod audio;
 pub mod auth;
 pub mod bootstrap;
+pub mod catalog;
 pub mod cipher;
 pub mod music;
 pub mod player;
