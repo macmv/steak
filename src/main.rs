@@ -2,6 +2,13 @@ use std::{error::Error, process::Stdio};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
+use st_api::{
+  audio::{AudioClient, AudioRequest},
+  bootstrap::{Bootstrapper, WebBootstrapper},
+  cipher::StreamUrl,
+  music::{MusicClient, MusicClientConfig},
+  player::{AudioQuality, PlayerParser, StandardPlayerParser},
+};
 use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc};
 
 /// Plays a compressed audio byte stream through Linux's `ffplay` utility.
@@ -57,8 +64,34 @@ where
 }
 
 #[tokio::main]
-async fn main() {
-  // Example:
-  // let stream = audio_client.stream(audio_request).await?;
-  // play(stream).await?;
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+  let video_id = std::env::args().nth(1).ok_or(
+    "usage: steak <youtube-video-id>\n\
+     example: steak dQw4w9WgXcQ",
+  )?;
+
+  // The API key and client version change with the Music web app, so retrieve
+  // them rather than baking a stale value into the executable.
+  let bootstrap = WebBootstrapper::default().bootstrap().await?;
+  let mut config = MusicClientConfig::default();
+  bootstrap.apply_to(&mut config);
+
+  let player_response = MusicClient::new(config).player(&video_id).await?;
+  let parser = StandardPlayerParser;
+  let format =
+    parser.choose_audio(parser.audio_formats(&player_response)?, AudioQuality::Balanced)?;
+  let stream_url = match format.stream_url {
+    // Direct URLs are short-lived, authorized media URLs returned by YouTube.
+    StreamUrl::Direct(url) => url,
+    StreamUrl::SignatureCipher(_) => {
+      return Err(
+        "YouTube returned a ciphered media URL; player-script deciphering is not wired up yet"
+          .into(),
+      );
+    }
+  };
+
+  eprintln!("playing {video_id}: {} at {} bps", format.mime_type, format.bitrate);
+  let audio = AudioClient::default().stream(AudioRequest::new(stream_url)).await?;
+  play(audio).await
 }
