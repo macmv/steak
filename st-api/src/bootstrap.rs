@@ -94,7 +94,11 @@ impl WebBootstrapper {
 }
 
 impl Default for WebBootstrapper {
-  fn default() -> Self { Self::new(header::HeaderValue::from_static("st-api/0.1")) }
+  fn default() -> Self {
+    Self::new(header::HeaderValue::from_static(
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    ))
+  }
 }
 
 impl Bootstrapper for WebBootstrapper {

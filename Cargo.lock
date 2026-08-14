@@ -806,6 +806,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -820,6 +821,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures-util",
+ "st-api",
  "tokio",
 ]
 

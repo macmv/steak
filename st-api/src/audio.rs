@@ -61,7 +61,7 @@ impl AudioClient {
   pub async fn stream(
     &self,
     request: AudioRequest,
-  ) -> reqwest::Result<impl Stream<Item = reqwest::Result<Bytes>>> {
+  ) -> reqwest::Result<impl Stream<Item = reqwest::Result<Bytes>> + use<>> {
     Ok(self.request(request).await?.bytes_stream())
   }
 }
