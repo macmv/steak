@@ -80,7 +80,9 @@ impl Default for MusicClientConfig {
     Self {
       context:    ClientContext::default(),
       api_key:    None,
-      user_agent: header::HeaderValue::from_static("st-api/0.1"),
+      user_agent: header::HeaderValue::from_static(
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      ),
       headers:    header::HeaderMap::new(),
     }
   }
@@ -107,7 +109,9 @@ impl MusicClient {
     payload.insert("context".into(), json!({ "client": self.config.context }));
 
     let mut url = Url::parse(BASE_URL).expect("valid YouTube Music base URL");
-    url.path_segments_mut().expect("base URL cannot be a base").push(endpoint.path());
+    // `BASE_URL` ends in `/`; appending with `path_segments_mut().push()`
+    // would preserve its final empty segment and produce `/v1//player`.
+    url.set_path(&format!("/youtubei/v1/{}", endpoint.path()));
     {
       let mut query = url.query_pairs_mut();
       query.append_pair("prettyPrint", "false");
@@ -207,5 +211,12 @@ mod tests {
   fn endpoint_paths_are_music_paths() {
     assert_eq!(Endpoint::SearchSuggestions.path(), "music/get_search_suggestions");
     assert_eq!(Endpoint::Queue.path(), "music/get_queue");
+  }
+
+  #[test]
+  fn player_url_has_no_double_slash() {
+    let mut url = Url::parse(BASE_URL).unwrap();
+    url.set_path(&format!("/youtubei/v1/{}", Endpoint::Player.path()));
+    assert_eq!(url.as_str(), "https://music.youtube.com/youtubei/v1/player");
   }
 }
