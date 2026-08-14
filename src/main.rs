@@ -101,12 +101,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   if args.get(1).and_then(|value| value.to_str()) == Some("auth") {
     return auth_command(&args[2..]);
   }
-  let (video_id, session_path) = match args.as_slice() {
-    [_, video_id] => (video_id.to_string_lossy().into_owned(), st_api::auth::session_path()),
-    [_, flag, path, video_id] if flag == "--session" => {
-      (video_id.to_string_lossy().into_owned(), std::path::PathBuf::from(path))
-    }
-    _ => return Err("usage: steak [--session <session-file>] <youtube-video-id>".into()),
+  let video_id = match args.as_slice() {
+    [_, video_id] => video_id.to_string_lossy().into_owned(),
+    _ => return Err("usage: steak <youtube-video-id>".into()),
   };
   info!("starting playback request for YouTube video {video_id}");
 
@@ -116,7 +113,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   debug!("received current YouTube Music client configuration");
   let mut config = MusicClientConfig::default();
   bootstrap.apply_to(&mut config);
-  let session = st_api::auth::StoredSession::load(&session_path)?;
+  let session = st_api::auth::StoredSession::load(&st_api::auth::session_path())?;
   config.headers.extend(session.auth_session().request_headers());
 
   let player_response = MusicClient::new(config).player(&video_id).await?;
