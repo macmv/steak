@@ -59,6 +59,26 @@ impl std::error::Error for PlayerError {}
 #[derive(Clone, Debug, Default)]
 pub struct StandardPlayerParser;
 
+impl StandardPlayerParser {
+  /// Returns the player JavaScript URL advertised by a player response.
+  pub fn player_script_url(response: &serde_json::Value) -> Option<reqwest::Url> {
+    find_string(response, "jsUrl")
+      .or_else(|| find_string(response, "js"))
+      .and_then(|url| reqwest::Url::parse(url).ok())
+  }
+}
+
+fn find_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+  match value {
+    serde_json::Value::Object(object) => object
+      .get(key)
+      .and_then(serde_json::Value::as_str)
+      .or_else(|| object.values().find_map(|value| find_string(value, key))),
+    serde_json::Value::Array(values) => values.iter().find_map(|value| find_string(value, key)),
+    _ => None,
+  }
+}
+
 impl PlayerParser for StandardPlayerParser {
   fn audio_formats(&self, response: &serde_json::Value) -> Result<Vec<AudioFormat>, PlayerError> {
     let status = response.pointer("/playabilityStatus/status").and_then(serde_json::Value::as_str);
@@ -168,5 +188,15 @@ mod tests {
     let formats = StandardPlayerParser.audio_formats(&response).unwrap();
     assert_eq!(formats.len(), 1);
     assert_eq!(formats[0].content_length, Some(42));
+  }
+
+  #[test]
+  fn extracts_player_script_url() {
+    let response =
+      serde_json::json!({"assets":{"jsUrl":"https://www.youtube.com/s/player/test/base.js"}});
+    assert_eq!(
+      StandardPlayerParser::player_script_url(&response).unwrap().as_str(),
+      "https://www.youtube.com/s/player/test/base.js"
+    );
   }
 }

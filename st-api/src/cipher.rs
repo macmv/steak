@@ -4,7 +4,9 @@
 //! require transforming its `n` query parameter. The player JavaScript changes
 //! regularly, so keep this logic replaceable and fixture-tested.
 
+use boa_engine::{Context, Source};
 use reqwest::Url;
+use serde_json::to_string;
 
 /// A URL embedded in a player response before any deciphering.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,6 +26,7 @@ pub enum CipherError {
   MissingSignature,
   InvalidUrl,
   PlayerScriptChanged,
+  JavaScript(String),
 }
 
 impl std::fmt::Display for CipherError {
@@ -35,8 +38,27 @@ impl std::fmt::Display for CipherError {
       Self::MissingSignature => f.write_str("cipher payload has no signature"),
       Self::InvalidUrl => f.write_str("cipher payload contains an invalid URL"),
       Self::PlayerScriptChanged => f.write_str("player script extraction no longer matches"),
+      Self::JavaScript(error) => write!(f, "player cipher JavaScript failed: {error}"),
     }
   }
+}
+
+/// Evaluates an already-extracted signature function with Boa.
+///
+/// Function extraction is intentionally separate because YouTube changes the
+/// surrounding minified player code. `function_expression` must evaluate to a
+/// unary JavaScript function accepting and returning a string.
+pub fn evaluate_signature(function_expression: &str, input: &str) -> Result<String, CipherError> {
+  let input = to_string(input).map_err(|error| CipherError::JavaScript(error.to_string()))?;
+  let source = format!("({function_expression})({input})");
+  let mut context = Context::default();
+  let value = context
+    .eval(Source::from_bytes(source.as_bytes()))
+    .map_err(|error| CipherError::JavaScript(error.to_string()))?;
+  value
+    .to_string(&mut context)
+    .map(|value| value.to_std_string_escaped())
+    .map_err(|error| CipherError::JavaScript(error.to_string()))
 }
 
 impl std::error::Error for CipherError {}
@@ -68,5 +90,20 @@ impl CipherResolver for DirectUrlResolver {
         Ok(url)
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn boa_evaluates_signature_function() {
+    let output = evaluate_signature(
+      "function(value) { return value.split('').reverse().join(''); }",
+      "abcdef",
+    )
+    .unwrap();
+    assert_eq!(output, "fedcba");
   }
 }
