@@ -12,6 +12,7 @@ use std::{
 use reqwest::header::HeaderMap;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 
 /// The conventional local session-file location used by the CLI and tests.
 pub fn session_path() -> PathBuf {
@@ -38,6 +39,18 @@ impl AuthSession {
       if let Ok(value) = cookies.parse() {
         headers.insert(reqwest::header::COOKIE, value);
       }
+      if let Some(sapisid) =
+        cookie_value(cookies, &["SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"])
+      {
+        let timestamp = std::time::SystemTime::now()
+          .duration_since(std::time::UNIX_EPOCH)
+          .map(|duration| duration.as_secs())
+          .unwrap_or_default();
+        let digest = sapisid_hash(timestamp, sapisid, "https://music.youtube.com");
+        if let Ok(value) = format!("SAPISIDHASH {timestamp}_{digest}").parse() {
+          headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+      }
     }
     headers
   }
@@ -45,6 +58,19 @@ impl AuthSession {
   pub fn from_cookie_header(cookies: String) -> Self {
     Self { cookies: Some(cookies), headers: HeaderMap::new() }
   }
+}
+
+fn cookie_value<'a>(cookies: &'a str, names: &[&str]) -> Option<&'a str> {
+  cookies
+    .split(';')
+    .filter_map(|cookie| cookie.trim().split_once('='))
+    .find_map(|(name, value)| names.contains(&name.trim()).then_some(value.trim()))
+}
+
+fn sapisid_hash(timestamp: u64, sapisid: &str, origin: &str) -> String {
+  let mut hasher = Sha1::new();
+  hasher.update(format!("{timestamp} {sapisid} {origin}"));
+  hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// A locally imported browser session. Treat it like a password.
