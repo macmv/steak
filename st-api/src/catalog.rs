@@ -1,5 +1,6 @@
 //! Conversion of Music search renderer trees into stable catalog objects.
 
+use crate::music::WatchEndpoint;
 use serde_json::Value;
 
 /// A track returned by YouTube Music search.
@@ -11,6 +12,7 @@ pub struct Track {
   pub album:      Option<Album>,
   pub duration:   Option<String>,
   pub thumbnails: Vec<Thumbnail>,
+  pub watch:      Option<WatchEndpoint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +63,7 @@ fn parse_track(row: &Value) -> Option<Track> {
   let columns = row.get("flexColumns")?.as_array()?;
   let title = column_text(columns.first()?)?;
   let video_id = find_string(row, "videoId")?;
+  let watch = find_watch_endpoint(row);
   let metadata = columns.get(1).and_then(column_runs).unwrap_or_default();
   let mut artists = Vec::new();
   let mut album = None;
@@ -98,7 +101,17 @@ fn parse_track(row: &Value) -> Option<Track> {
       })
     })
     .collect();
-  Some(Track { video_id: video_id.into(), title, artists, album, duration, thumbnails })
+  Some(Track { video_id: video_id.into(), title, artists, album, duration, thumbnails, watch })
+}
+
+fn find_watch_endpoint(row: &Value) -> Option<WatchEndpoint> {
+  let endpoint = find_object(row, "watchEndpoint")?;
+  Some(WatchEndpoint {
+    video_id:              endpoint.get("videoId")?.as_str()?.into(),
+    playlist_id:           endpoint.get("playlistId").and_then(Value::as_str).map(str::to_owned),
+    params:                endpoint.get("params").and_then(Value::as_str).map(str::to_owned),
+    click_tracking_params: find_string(row, "clickTrackingParams").map(str::to_owned),
+  })
 }
 
 fn column_text(column: &Value) -> Option<String> {
@@ -127,6 +140,17 @@ fn find_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
   }
 }
 
+fn find_object<'a>(value: &'a Value, key: &str) -> Option<&'a serde_json::Map<String, Value>> {
+  match value {
+    Value::Object(object) => object
+      .get(key)
+      .and_then(Value::as_object)
+      .or_else(|| object.values().find_map(|value| find_object(value, key))),
+    Value::Array(values) => values.iter().find_map(|value| find_object(value, key)),
+    _ => None,
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -135,7 +159,7 @@ mod tests {
   fn extracts_track_from_search_fixture() {
     let response = serde_json::json!({"contents":[{"musicResponsiveListItemRenderer": {
       "flexColumns":[
-        {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Around the World"}]}}},
+        {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Around the World", "navigationEndpoint":{"watchEndpoint":{"videoId":"LKYPYj2XX80","playlistId":"RDexample","params":"params"}}}]}}},
         {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[
           {"text":"Daft Punk", "navigationEndpoint":{"browseEndpoint":{"browseId":"UCartist"}}},
           {"text":" • "},
@@ -151,5 +175,6 @@ mod tests {
     assert_eq!(tracks[0].title, "Around the World");
     assert_eq!(tracks[0].artists[0].name, "Daft Punk");
     assert_eq!(tracks[0].album.as_ref().unwrap().name, "Homework");
+    assert_eq!(tracks[0].watch.as_ref().unwrap().playlist_id.as_deref(), Some("RDexample"));
   }
 }

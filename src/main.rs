@@ -65,16 +65,27 @@ where
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-  let video_id = std::env::args().nth(1).ok_or(
-    "usage: steak <youtube-video-id>\n\
-     example: steak dQw4w9WgXcQ",
-  )?;
+  let args: Vec<_> = std::env::args_os().collect();
+  if args.get(1).and_then(|value| value.to_str()) == Some("auth") {
+    return auth_command(&args[2..]);
+  }
+  let (video_id, session_path) = match args.as_slice() {
+    [_, video_id] => (video_id.to_string_lossy().into_owned(), None),
+    [_, flag, path, video_id] if flag == "--session" => {
+      (video_id.to_string_lossy().into_owned(), Some(std::path::PathBuf::from(path)))
+    }
+    _ => return Err("usage: steak [--session <session-file>] <youtube-video-id>".into()),
+  };
 
   // The API key and client version change with the Music web app, so retrieve
   // them rather than baking a stale value into the executable.
   let bootstrap = WebBootstrapper::default().bootstrap().await?;
   let mut config = MusicClientConfig::default();
   bootstrap.apply_to(&mut config);
+  if let Some(path) = session_path {
+    let session = st_api::auth::StoredSession::load(&path)?;
+    config.headers.extend(session.auth_session().request_headers());
+  }
 
   let player_response = MusicClient::new(config).player(&video_id).await?;
   let parser = StandardPlayerParser;
@@ -94,4 +105,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   eprintln!("playing {video_id}: {} at {} bps", format.mime_type, format.bitrate);
   let audio = AudioClient::default().stream(AudioRequest::new(stream_url)).await?;
   play(audio).await
+}
+
+fn auth_command(args: &[std::ffi::OsString]) -> Result<(), Box<dyn Error + Send + Sync>> {
+  if args.first().and_then(|value| value.to_str()) != Some("import-firefox") || args.len() != 3 {
+    return Err("usage: steak auth import-firefox <firefox-profile> <session-file>".into());
+  }
+  let session = st_api::auth::import_firefox_profile(std::path::Path::new(&args[1]))?;
+  session.save(std::path::Path::new(&args[2]))?;
+  eprintln!("Imported YouTube session. Keep the session file private.");
+  Ok(())
 }

@@ -22,6 +22,15 @@ pub enum Endpoint {
   PlaylistEdit,
 }
 
+/// Navigation state carried by a search or queue item's watch endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchEndpoint {
+  pub video_id:              String,
+  pub playlist_id:           Option<String>,
+  pub params:                Option<String>,
+  pub click_tracking_params: Option<String>,
+}
+
 impl Endpoint {
   fn path(self) -> &'static str {
     match self {
@@ -112,7 +121,16 @@ impl MusicClient {
   pub async fn call(
     &self,
     endpoint: Endpoint,
+    payload: Map<String, Value>,
+  ) -> reqwest::Result<Value> {
+    self.call_with_context(endpoint, payload, Map::new()).await
+  }
+
+  async fn call_with_context(
+    &self,
+    endpoint: Endpoint,
     mut payload: Map<String, Value>,
+    context_overrides: Map<String, Value>,
   ) -> reqwest::Result<Value> {
     let mut client = self.config.client_context.clone();
     let core_client = serde_json::to_value(&self.config.context)
@@ -122,6 +140,7 @@ impl MusicClient {
       .clone();
     client.extend(core_client);
     let mut context = self.config.request_context.clone();
+    context.extend(context_overrides);
     context.insert("client".into(), Value::Object(client));
     payload.insert("context".into(), Value::Object(context));
 
@@ -199,21 +218,65 @@ impl MusicClient {
   }
 
   pub async fn player(&self, video_id: impl Into<String>) -> reqwest::Result<Value> {
+    self.call(Endpoint::Player, player_body(video_id.into(), None, None)).await
+  }
+
+  /// Fetches queue/watch-page data using navigation state from a result row.
+  pub async fn next_for_watch(&self, watch: &WatchEndpoint) -> reqwest::Result<Value> {
+    let mut body =
+      Map::from_iter([(String::from("videoId"), Value::String(watch.video_id.clone()))]);
+    if let Some(playlist_id) = &watch.playlist_id {
+      body.insert("playlistId".into(), Value::String(playlist_id.clone()));
+    }
+    if let Some(params) = &watch.params {
+      body.insert("params".into(), Value::String(params.clone()));
+    }
+    self.call_with_context(Endpoint::Next, body, click_tracking_context(watch)).await
+  }
+
+  /// Fetches player data using navigation state from a result row.
+  pub async fn player_for_watch(&self, watch: &WatchEndpoint) -> reqwest::Result<Value> {
     self
-      .call(
+      .call_with_context(
         Endpoint::Player,
-        Map::from_iter([
-          (String::from("videoId"), Value::String(video_id.into())),
-          (
-            String::from("playbackContext"),
-            json!({ "contentPlaybackContext": { "html5Preference": "HTML5_PREF_WANTS" } }),
-          ),
-          (String::from("racyCheckOk"), Value::Bool(true)),
-          (String::from("contentCheckOk"), Value::Bool(true)),
-        ]),
+        player_body(watch.video_id.clone(), watch.playlist_id.clone(), watch.params.clone()),
+        click_tracking_context(watch),
       )
       .await
   }
+}
+
+fn player_body(
+  video_id: String,
+  playlist_id: Option<String>,
+  params: Option<String>,
+) -> Map<String, Value> {
+  let mut body = Map::from_iter([
+    (String::from("videoId"), Value::String(video_id)),
+    (
+      String::from("playbackContext"),
+      json!({ "contentPlaybackContext": { "html5Preference": "HTML5_PREF_WANTS" } }),
+    ),
+    (String::from("racyCheckOk"), Value::Bool(true)),
+    (String::from("contentCheckOk"), Value::Bool(true)),
+  ]);
+  if let Some(playlist_id) = playlist_id {
+    body.insert("playlistId".into(), Value::String(playlist_id));
+  }
+  if let Some(params) = params {
+    body.insert("params".into(), Value::String(params));
+  }
+  body
+}
+
+fn click_tracking_context(watch: &WatchEndpoint) -> Map<String, Value> {
+  watch
+    .click_tracking_params
+    .as_ref()
+    .map(|params| {
+      Map::from_iter([(String::from("clickTracking"), json!({ "clickTrackingParams": params }))])
+    })
+    .unwrap_or_default()
 }
 
 impl Default for MusicClient {
