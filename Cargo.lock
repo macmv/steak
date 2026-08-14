@@ -1723,7 +1723,10 @@ checksum = "3b9b39299b249ad65f3b7e96443bad61c02ca5cd3589f46cb6d610a0fd6c0d6a"
 name = "st-api"
 version = "0.1.0"
 dependencies = [
+ "boa_ast",
  "boa_engine",
+ "boa_interner",
+ "boa_parser",
  "bytes",
  "futures-core",
  "log",

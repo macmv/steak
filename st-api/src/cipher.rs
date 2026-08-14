@@ -4,7 +4,10 @@
 //! require transforming its `n` query parameter. The player JavaScript changes
 //! regularly, so keep this logic replaceable and fixture-tested.
 
+use boa_ast::scope::Scope;
 use boa_engine::{Context, Source};
+use boa_interner::Interner;
+use boa_parser::{Parser, Source as ParserSource};
 use log::{debug, warn};
 use reqwest::{Client, Url};
 use serde_json::to_string;
@@ -125,6 +128,7 @@ impl BoaCipherResolver {
         );
         let mut url = Url::parse(fields.get("url").ok_or(CipherError::InvalidUrl)?)
           .map_err(|_| CipherError::InvalidUrl)?;
+        debug!("media URL parameters: signature={}, n={}", url.query_pairs().any(|(k, _)| k == "sig" || k == "signature"), url.query_pairs().any(|(k, _)| k == "n"));
         if let Some(signature) = fields.get("sig").or_else(|| fields.get("signature")) {
           debug!("signature cipher already has a signature; no JavaScript transformation needed");
           let parameter = fields.get("sp").map(String::as_str).unwrap_or("signature");
@@ -165,18 +169,40 @@ impl BoaCipherResolver {
 /// This intentionally fails closed when the player deploys a different shape.
 pub fn extract_signature_function(script: &str) -> Option<&str> {
   let mut offset = 0;
+  let mut first_candidate = None;
   while let Some(split_offset) = script[offset..].find(".split") {
     let split_offset = offset + split_offset;
-    let function_start = script[..split_offset].rfind("function")?;
-    let open_brace = script[function_start..].find('{')? + function_start;
-    let close_brace = matching_brace(script, open_brace)?;
+    let Some(function_start) = script[..split_offset].rfind("function") else {
+      offset = split_offset + ".split".len();
+      continue;
+    };
+    let Some(open_brace) = script[function_start..].find('{').map(|n| n + function_start) else {
+      offset = split_offset + ".split".len();
+      continue;
+    };
+    let Some(close_brace) = matching_brace(script, open_brace) else {
+      offset = split_offset + ".split".len();
+      continue;
+    };
     let candidate = &script[function_start..=close_brace];
-    if candidate.contains(".join") {
+    first_candidate.get_or_insert(candidate);
+    if ast_looks_like_signature(candidate) {
       return Some(candidate);
     }
     offset = split_offset + ".split".len();
   }
-  None
+  first_candidate
+}
+
+fn ast_looks_like_signature(candidate: &str) -> bool {
+  let wrapped = format!("({candidate});");
+  let mut parser = Parser::new(ParserSource::from_bytes(wrapped.as_bytes()));
+  let mut interner = Interner::default();
+  let scope = Scope::new_global();
+  match parser.parse_script(&scope, &mut interner) {
+    Ok(_) => candidate.contains("split") && candidate.contains("join"),
+    Err(_) => false,
+  }
 }
 
 fn matching_brace(script: &str, open: usize) -> Option<usize> {
