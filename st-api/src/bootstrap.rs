@@ -1,11 +1,11 @@
 //! Bootstrap data obtained from the YouTube Music web application.
 //!
 //! The bootstrapper fetches the Music landing page and extracts its current
-//! Innertube configuration. It does not log a user in or persist cookies.
+//! Innertube configuration and preserves anonymous cookies from that response.
 
 use crate::music::MusicClientConfig;
 use reqwest::{Client, header};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Values that change with the Music web application deployment.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,6 +14,11 @@ pub struct BootstrapData {
   pub client_version:    String,
   pub visitor_data:      Option<String>,
   pub player_script_url: Option<String>,
+  /// The complete non-cookie request context supplied by the Music web page.
+  pub request_context:   Map<String, Value>,
+  /// Anonymous response cookies, suitable for the immediately following API
+  /// requests. This is not an authenticated browser session.
+  pub cookies:           Option<String>,
 }
 
 impl BootstrapData {
@@ -22,6 +27,17 @@ impl BootstrapData {
     config.api_key = Some(self.api_key.clone());
     config.context.client_version = self.client_version.clone();
     config.context.visitor_data = self.visitor_data.clone();
+    let mut request_context = self.request_context.clone();
+    config.client_context = request_context
+      .remove("client")
+      .and_then(|client| client.as_object().cloned())
+      .unwrap_or_default();
+    config.request_context = request_context;
+    if let Some(cookies) = &self.cookies {
+      if let Ok(value) = cookies.parse() {
+        config.headers.insert(header::COOKIE, value);
+      }
+    }
   }
 }
 
@@ -89,7 +105,15 @@ impl WebBootstrapper {
     let visitor_data = config.get("VISITOR_DATA").and_then(Value::as_str).map(str::to_owned);
     let player_script_url =
       config.get("PLAYER_JS_URL").and_then(Value::as_str).map(normalize_player_url).transpose()?;
-    Ok(BootstrapData { api_key, client_version, visitor_data, player_script_url })
+    let request_context = config.as_object().cloned().ok_or(BootstrapError::InvalidConfig)?;
+    Ok(BootstrapData {
+      api_key,
+      client_version,
+      visitor_data,
+      player_script_url,
+      request_context,
+      cookies: None,
+    })
   }
 }
 
@@ -106,7 +130,7 @@ impl Bootstrapper for WebBootstrapper {
     &self,
   ) -> impl std::future::Future<Output = Result<BootstrapData, BootstrapError>> + Send {
     async move {
-      let html = self
+      let response = self
         .http
         .get("https://music.youtube.com/")
         .header(header::USER_AGENT, &self.user_agent)
@@ -115,13 +139,25 @@ impl Bootstrapper for WebBootstrapper {
         .await
         .map_err(BootstrapError::Request)?
         .error_for_status()
-        .map_err(BootstrapError::Request)?
-        .text()
-        .await
         .map_err(BootstrapError::Request)?;
-      Self::parse(&html)
+      let cookies = response_cookies(response.headers());
+      let html = response.text().await.map_err(BootstrapError::Request)?;
+      let mut data = Self::parse(&html)?;
+      data.cookies = cookies;
+      Ok(data)
     }
   }
+}
+
+fn response_cookies(headers: &header::HeaderMap) -> Option<String> {
+  let cookies: Vec<_> = headers
+    .get_all(header::SET_COOKIE)
+    .iter()
+    .filter_map(|value| value.to_str().ok())
+    .filter_map(|value| value.split(';').next())
+    .filter(|value| !value.is_empty())
+    .collect();
+  (!cookies.is_empty()).then(|| cookies.join("; "))
 }
 
 fn string_field(config: &Value, field: &'static str) -> Result<String, BootstrapError> {

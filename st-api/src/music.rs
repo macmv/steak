@@ -68,22 +68,30 @@ impl Default for ClientContext {
 /// Configuration for [`MusicClient`].
 #[derive(Clone, Debug)]
 pub struct MusicClientConfig {
-  pub context:    ClientContext,
-  pub api_key:    Option<String>,
-  pub user_agent: header::HeaderValue,
+  pub context:         ClientContext,
+  /// Remaining fields from `INNERTUBE_CONTEXT.client`, such as browser and
+  /// platform metadata. Core fields in [`ClientContext`] take precedence.
+  pub client_context:  Map<String, Value>,
+  /// Remaining top-level `INNERTUBE_CONTEXT` fields, such as `user` and
+  /// `request`.
+  pub request_context: Map<String, Value>,
+  pub api_key:         Option<String>,
+  pub user_agent:      header::HeaderValue,
   /// Cookies and authorization headers for authenticated requests.
-  pub headers:    header::HeaderMap,
+  pub headers:         header::HeaderMap,
 }
 
 impl Default for MusicClientConfig {
   fn default() -> Self {
     Self {
-      context:    ClientContext::default(),
-      api_key:    None,
-      user_agent: header::HeaderValue::from_static(
+      context:         ClientContext::default(),
+      client_context:  Map::new(),
+      request_context: Map::new(),
+      api_key:         None,
+      user_agent:      header::HeaderValue::from_static(
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
       ),
-      headers:    header::HeaderMap::new(),
+      headers:         header::HeaderMap::new(),
     }
   }
 }
@@ -106,7 +114,16 @@ impl MusicClient {
     endpoint: Endpoint,
     mut payload: Map<String, Value>,
   ) -> reqwest::Result<Value> {
-    payload.insert("context".into(), json!({ "client": self.config.context }));
+    let mut client = self.config.client_context.clone();
+    let core_client = serde_json::to_value(&self.config.context)
+      .expect("ClientContext must serialize")
+      .as_object()
+      .expect("ClientContext serializes to an object")
+      .clone();
+    client.extend(core_client);
+    let mut context = self.config.request_context.clone();
+    context.insert("client".into(), Value::Object(client));
+    payload.insert("context".into(), Value::Object(context));
 
     let mut url = Url::parse(BASE_URL).expect("valid YouTube Music base URL");
     // `BASE_URL` ends in `/`; appending with `path_segments_mut().push()`
@@ -185,7 +202,15 @@ impl MusicClient {
     self
       .call(
         Endpoint::Player,
-        Map::from_iter([(String::from("videoId"), Value::String(video_id.into()))]),
+        Map::from_iter([
+          (String::from("videoId"), Value::String(video_id.into())),
+          (
+            String::from("playbackContext"),
+            json!({ "contentPlaybackContext": { "html5Preference": "HTML5_PREF_WANTS" } }),
+          ),
+          (String::from("racyCheckOk"), Value::Bool(true)),
+          (String::from("contentCheckOk"), Value::Bool(true)),
+        ]),
       )
       .await
   }
