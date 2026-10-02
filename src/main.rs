@@ -1,18 +1,23 @@
-use std::{error::Error, process::Stdio};
+use std::{error::Error, process::Stdio, sync::Arc};
 
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
 use futures_util::{Stream, StreamExt};
 use log::{debug, error, info, warn};
 use st_api::{
+  cache::Cache,
   innertube::{
     bootstrap::{Bootstrapper, WebBootstrapper},
     client::{MusicClient, MusicClientConfig},
   },
   media::audio::{AudioClient, AudioRequest},
   playback::{
-    player_script::{EjsCipherResolver, signature_timestamp},
+    player_script::{
+      EjsCipherResolver, player_cache_key, resolve_and_preprocess, resolve_with_solver,
+      signature_timestamp,
+    },
     response::{AudioQuality, PlayerParser, StandardPlayerParser},
+    solver::Solver,
   },
 };
 use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc};
@@ -139,6 +144,107 @@ fn setup_logging() -> Result<(), log::SetLoggerError> {
     .apply()
 }
 
+/// Resolves `video_id` to a stream of audio bytes.
+///
+/// The web app config, signature timestamp and challenge solver are the same
+/// for every video, so they come from the cache when present. Anything missing
+/// is rebuilt the slow way and saved.
+async fn open_stream(
+  cache: &Cache,
+  video_id: &str,
+) -> Result<
+  impl Stream<Item = Result<Bytes, impl Error + Send + Sync + 'static + use<>>> + Send + 'static + use<>,
+  Box<dyn Error + Send + Sync>,
+> {
+  let bootstrapper = WebBootstrapper::default();
+  let bootstrap = match cache.bootstrap() {
+    Some(bootstrap) => {
+      debug!("using cached YouTube Music client configuration");
+      bootstrap
+    }
+    None => {
+      // The API key and client version change with the Music web app, so
+      // retrieve them rather than baking a stale value into the executable.
+      let mut bootstrap = bootstrapper.bootstrap().await?;
+      debug!("received current YouTube Music client configuration");
+      if bootstrap.player_script_url.is_none() {
+        debug!("Music page did not advertise a JavaScript URL; fetching the watch page");
+        let url = bootstrapper.player_script_url(video_id).await?;
+        bootstrap.player_script_url = url.map(String::from);
+      }
+      if bootstrap.player_script_url.is_none() {
+        warn!("no player JavaScript URL was advertised for {video_id}");
+      }
+      cache.store_bootstrap(&bootstrap);
+      bootstrap
+    }
+  };
+  let script_url = bootstrap.script_url().ok_or("no player JavaScript URL was advertised")?;
+
+  let mut config = MusicClientConfig::default();
+  bootstrap.apply_to(&mut config);
+  let session =
+    st_api::account::session::StoredSession::load(&st_api::account::session::session_path())?;
+  config.headers.extend(session.auth_session().request_headers());
+
+  // The player request must name the player script's signature timestamp. With
+  // a cached solver, load it in the background while the request is in flight;
+  // otherwise download the full script and solve from it after the request.
+  let resolver = EjsCipherResolver::new();
+  let (signature_timestamp, solve) = match (cache.signature_timestamp(), cache.solver()) {
+    (Some(timestamp), Some(solver)) => {
+      debug!("using cached solver for signature timestamp {timestamp}");
+      (Some(timestamp), Solve::Cached(Solver::spawn(solver.into())))
+    }
+    _ => {
+      let script = resolver.script(&script_url).await?;
+      let timestamp = signature_timestamp(&script);
+      match timestamp {
+        Some(timestamp) => {
+          debug!("player signature timestamp is {timestamp}");
+          cache.store_signature_timestamp(timestamp);
+        }
+        None => warn!("no signature timestamp; the player response may not match the script"),
+      }
+      (timestamp, Solve::Script(script))
+    }
+  };
+
+  let player_response =
+    MusicClient::new(config).player_with_signature_timestamp(video_id, signature_timestamp).await?;
+  debug!("received player response for {video_id}");
+  if let (Solve::Cached(_), Some(url)) =
+    (&solve, StandardPlayerParser::player_script_url(&player_response))
+  {
+    if player_cache_key(&url) != player_cache_key(&script_url) {
+      return Err("the player script changed since the cache was written".into());
+    }
+  }
+  let parser = StandardPlayerParser;
+  let format =
+    parser.choose_audio(parser.audio_formats(&player_response)?, AudioQuality::Balanced)?;
+  let stream_url = match solve {
+    Solve::Cached(solver) => resolve_with_solver(&format.stream_url, &solver).await?,
+    Solve::Script(script) => {
+      let (url, preprocessed) = resolve_and_preprocess(script, &format.stream_url).await?;
+      if let Some(preprocessed) = preprocessed {
+        cache.store_solver(&preprocessed);
+      }
+      url
+    }
+  };
+
+  info!("playing {video_id}: {} at {} bps", format.mime_type, format.bitrate);
+  Ok(AudioClient::default().stream(AudioRequest::new(stream_url)).await?)
+}
+
+enum Solve {
+  /// A solver loaded from the cache.
+  Cached(Solver),
+  /// The full player script, which must be solved the slow way.
+  Script(Arc<str>),
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   setup_logging()?;
@@ -154,60 +260,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     cli.video_id.ok_or("a YouTube video ID is required; run `steak --help` for usage")?;
   info!("starting playback request for YouTube video {video_id}");
 
-  // The API key and client version change with the Music web app, so retrieve
-  // them rather than baking a stale value into the executable.
-  let bootstrapper = WebBootstrapper::default();
-  let bootstrap = bootstrapper.bootstrap().await?;
-  debug!("received current YouTube Music client configuration");
-  let mut config = MusicClientConfig::default();
-  bootstrap.apply_to(&mut config);
-  let session =
-    st_api::account::session::StoredSession::load(&st_api::account::session::session_path())?;
-  config.headers.extend(session.auth_session().request_headers());
-
-  // The player request must name the player script's signature timestamp, so
-  // find and download the script before asking for the player response.
-  let resolver = EjsCipherResolver::new();
-  let script_url = match bootstrap.script_url() {
-    Some(url) => {
-      debug!("using player JavaScript URL from the Music page");
-      Some(url)
+  let cache = Cache::open();
+  let populated = cache.is_populated();
+  let audio = match open_stream(&cache, &video_id).await {
+    Ok(audio) => audio,
+    // Something cached no longer works (YouTube rotated the player, say). Drop
+    // all of it and rebuild from scratch, once.
+    Err(error) if populated => {
+      warn!("cached state failed ({error}); clearing it and starting over");
+      cache.clear();
+      open_stream(&cache, &video_id).await?
     }
-    None => {
-      debug!("Music page did not advertise a JavaScript URL; fetching the watch page");
-      let url = bootstrapper.player_script_url(&video_id).await?;
-      if url.is_some() {
-        debug!("using player JavaScript URL from the watch page");
-      } else {
-        warn!("watch page did not advertise PLAYER_JS_URL for {video_id}");
-      }
-      url
-    }
+    Err(error) => return Err(error),
   };
-  let signature_timestamp = match &script_url {
-    Some(url) => signature_timestamp(&resolver.script(url).await?),
-    None => None,
-  };
-  match signature_timestamp {
-    Some(timestamp) => debug!("player signature timestamp is {timestamp}"),
-    None => warn!("no signature timestamp; the player response may not match the player script"),
-  }
-
-  let player_response = MusicClient::new(config)
-    .player_with_signature_timestamp(&video_id, signature_timestamp)
-    .await?;
-  debug!("received player response for {video_id}");
-  let parser = StandardPlayerParser;
-  let format =
-    parser.choose_audio(parser.audio_formats(&player_response)?, AudioQuality::Balanced)?;
-  // Direct URLs need no player script unless they carry an `n` challenge.
-  let script_url = script_url
-    .or_else(|| StandardPlayerParser::player_script_url(&player_response))
-    .ok_or("no player JavaScript URL was advertised")?;
-  let stream_url = resolver.resolve(&script_url, &format.stream_url).await?;
-
-  info!("playing {video_id}: {} at {} bps", format.mime_type, format.bitrate);
-  let audio = AudioClient::default().stream(AudioRequest::new(stream_url)).await?;
   play(audio).await
 }
 

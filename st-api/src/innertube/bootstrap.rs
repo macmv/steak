@@ -6,10 +6,11 @@
 use crate::innertube::client::MusicClientConfig;
 use log::{debug, warn};
 use reqwest::{Client, header};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Values that change with the Music web application deployment.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BootstrapData {
   pub api_key:           String,
   pub client_version:    String,

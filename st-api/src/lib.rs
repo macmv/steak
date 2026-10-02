@@ -5,6 +5,7 @@
 //! not leak into the application's domain model.
 
 pub mod account;
+pub mod cache;
 pub mod catalog;
 pub mod innertube;
 pub mod media;

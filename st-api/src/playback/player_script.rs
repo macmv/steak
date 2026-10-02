@@ -14,7 +14,7 @@ use std::{
 use log::debug;
 use reqwest::{Client, Url};
 
-use super::solver::{self, SolverError};
+use super::solver::{self, Solver, SolverError};
 
 /// A URL embedded in a player response before any deciphering.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,6 +187,38 @@ impl EjsCipherResolver {
   }
 }
 
+/// Resolves a stream URL with an already loaded [`Solver`].
+pub async fn resolve_with_solver(stream: &StreamUrl, solver: &Solver) -> Result<Url, CipherError> {
+  let cipher = cipher_for(stream)?;
+  let (sigs, ns) = challenges(&cipher);
+  let solved = if sigs.is_empty() && ns.is_empty() {
+    solver::Solved::default()
+  } else {
+    solver.solve(sigs, ns).await?
+  };
+  assemble(cipher, &solved)
+}
+
+/// Resolves a stream URL by solving against the full player script. Also
+/// returns the preprocessed player, which a later [`Solver`] can load instead
+/// of this slow path.
+pub async fn resolve_and_preprocess(
+  script: Arc<str>,
+  stream: &StreamUrl,
+) -> Result<(Url, Option<String>), CipherError> {
+  let cipher = cipher_for(stream)?;
+  let (sigs, ns) = challenges(&cipher);
+  let solved = if sigs.is_empty() && ns.is_empty() {
+    solver::Solved::default()
+  } else {
+    tokio::task::spawn_blocking(move || solver::solve(&script, &sigs, &ns))
+      .await
+      .map_err(|error| SolverError::Runtime(error.to_string()))??
+  };
+  let preprocessed = solved.preprocessed.clone();
+  Ok((assemble(cipher, &solved)?, preprocessed))
+}
+
 /// Reads the player's `signatureTimestamp`.
 ///
 /// The `player` request must send this value so the ciphers it returns match
@@ -230,7 +262,8 @@ fn assemble(cipher: Cipher, solved: &solver::Solved) -> Result<Url, CipherError>
   Ok(url)
 }
 
-fn player_cache_key(url: &Url) -> String {
+/// The player version in a script URL (`8ab5c328` in `/s/player/8ab5c328/...`).
+pub fn player_cache_key(url: &Url) -> String {
   url
     .path_segments()
     .and_then(|segments| {
