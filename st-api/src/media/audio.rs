@@ -69,12 +69,17 @@ impl AudioClient {
 
   /// Sends an audio request and yields body chunks as they arrive.
   ///
-  /// The returned stream yields an error for network or body-decoding failures.
+  /// Fails up front on an HTTP error status, so a rejected URL (for example a
+  /// 403) is reported instead of looking like an empty stream. The returned
+  /// stream yields an error for network or body-decoding failures.
   pub async fn stream(
     &self,
     request: AudioRequest,
   ) -> reqwest::Result<impl Stream<Item = reqwest::Result<Bytes>> + use<>> {
-    Ok(self.request(request).await?.bytes_stream())
+    // The URL carries signed, short-lived credentials, so keep it out of
+    // errors.
+    let response = self.request(request).await?.error_for_status().map_err(|e| e.without_url())?;
+    Ok(response.bytes_stream())
   }
 }
 
