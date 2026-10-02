@@ -16,3 +16,9 @@ futures-util = "0.3"
 log = "0.4.33"
 st-api = { path = "st-api" }
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync"] }
+
+# The EJS challenge solver runs a full JS parser over the 2.6 MB player inside
+# QuickJS; at -O0 that takes ~15s. Only the C engine needs optimizing in dev
+# (cc reads OPT_LEVEL from this profile); everything else stays unoptimized.
+[profile.dev.package.rquickjs-sys]
+opt-level = 3
