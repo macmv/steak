@@ -11,6 +11,7 @@ use st_api::{
   },
   media::audio::{AudioClient, AudioRequest},
   playback::{
+    access::po_token::{BotguardCliProvider, authorize_stream},
     player_script::{EjsCipherResolver, signature_timestamp},
     response::{AudioQuality, PlayerParser, StandardPlayerParser},
   },
@@ -206,8 +207,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     .ok_or("no player JavaScript URL was advertised")?;
   let stream_url = resolver.resolve(&script_url, &format.stream_url).await?;
 
+  // googlevideo refuses a stream past its first chunk unless it carries a
+  // valid PoToken, so make sure the URL is authorized before streaming it.
+  let audio_client = AudioClient::default();
+  let botguard = match std::env::var_os("STEAK_BOTGUARD") {
+    Some(binary) => BotguardCliProvider::new(binary),
+    None => BotguardCliProvider::default(),
+  };
+  let stream_url = authorize_stream(&botguard, &audio_client, stream_url, &video_id).await?;
+
   info!("playing {video_id}: {} at {} bps", format.mime_type, format.bitrate);
-  let audio = AudioClient::default().stream(AudioRequest::new(stream_url)).await?;
+  let audio = audio_client.stream_chunked(AudioRequest::new(stream_url)).await?;
   play(audio).await
 }
 

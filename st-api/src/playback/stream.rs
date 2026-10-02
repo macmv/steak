@@ -101,7 +101,7 @@ where
   .map_err(StreamFlowError::Delivery)
 }
 
-fn replace_query_parameter(url: &mut Url, name: &str, replacement: &str) {
+pub(crate) fn replace_query_parameter(url: &mut Url, name: &str, replacement: &str) {
   let pairs = url
     .query_pairs()
     .map(|(key, value)| (key.into_owned(), value.into_owned()))
