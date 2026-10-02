@@ -11,7 +11,7 @@ use st_api::{
   },
   media::audio::{AudioClient, AudioRequest},
   playback::{
-    player_script::{EjsCipherResolver, StreamUrl},
+    player_script::{EjsCipherResolver, signature_timestamp},
     response::{AudioQuality, PlayerParser, StandardPlayerParser},
   },
 };
@@ -159,34 +159,46 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     st_api::account::session::StoredSession::load(&st_api::account::session::session_path())?;
   config.headers.extend(session.auth_session().request_headers());
 
-  let player_response = MusicClient::new(config).player(&video_id).await?;
+  // The player request must name the player script's signature timestamp, so
+  // find and download the script before asking for the player response.
+  let resolver = EjsCipherResolver::new();
+  let script_url = match bootstrap.script_url() {
+    Some(url) => {
+      debug!("using player JavaScript URL from the Music page");
+      Some(url)
+    }
+    None => {
+      debug!("Music page did not advertise a JavaScript URL; fetching the watch page");
+      let url = bootstrapper.player_script_url(&video_id).await?;
+      if url.is_some() {
+        debug!("using player JavaScript URL from the watch page");
+      } else {
+        warn!("watch page did not advertise PLAYER_JS_URL for {video_id}");
+      }
+      url
+    }
+  };
+  let signature_timestamp = match &script_url {
+    Some(url) => signature_timestamp(&resolver.script(url).await?),
+    None => None,
+  };
+  match signature_timestamp {
+    Some(timestamp) => debug!("player signature timestamp is {timestamp}"),
+    None => warn!("no signature timestamp; the player response may not match the player script"),
+  }
+
+  let player_response = MusicClient::new(config)
+    .player_with_signature_timestamp(&video_id, signature_timestamp)
+    .await?;
   debug!("received player response for {video_id}");
   let parser = StandardPlayerParser;
   let format =
     parser.choose_audio(parser.audio_formats(&player_response)?, AudioQuality::Balanced)?;
-  let stream_url = match format.stream_url {
-    // Direct URLs are short-lived, authorized media URLs returned by YouTube.
-    StreamUrl::Direct(url) => url,
-    StreamUrl::SignatureCipher(cipher) => {
-      let stream = StreamUrl::SignatureCipher(cipher);
-      let script_url = if let Some(url) = StandardPlayerParser::player_script_url(&player_response)
-      {
-        debug!("using player JavaScript URL from the player response");
-        Some(url)
-      } else {
-        debug!("player response did not advertise a JavaScript URL; fetching the watch page");
-        let url = bootstrapper.player_script_url(&video_id).await?;
-        if url.is_some() {
-          debug!("using player JavaScript URL from the watch page");
-        } else {
-          warn!("watch page did not advertise PLAYER_JS_URL for {video_id}");
-        }
-        url
-      };
-      let script_url = script_url.ok_or("no player JavaScript URL was advertised")?;
-      EjsCipherResolver::new().resolve(&script_url, &stream).await?
-    }
-  };
+  // Direct URLs need no player script unless they carry an `n` challenge.
+  let script_url = script_url
+    .or_else(|| StandardPlayerParser::player_script_url(&player_response))
+    .ok_or("no player JavaScript URL was advertised")?;
+  let stream_url = resolver.resolve(&script_url, &format.stream_url).await?;
 
   info!("playing {video_id}: {} at {} bps", format.mime_type, format.bitrate);
   let audio = AudioClient::default().stream(AudioRequest::new(stream_url)).await?;

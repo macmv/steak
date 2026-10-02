@@ -63,10 +63,21 @@ struct Cipher {
 
 #[derive(Debug, Eq, PartialEq)]
 enum Signature {
+  /// A direct URL: there is no signature to add.
+  None,
   /// Already usable as-is.
   Ready(String),
   /// The `s` value; it must be solved against the player script.
   Encrypted(String),
+}
+
+fn cipher_for(stream: &StreamUrl) -> Result<Cipher, CipherError> {
+  match stream {
+    StreamUrl::Direct(url) => {
+      Ok(Cipher { url: url.clone(), parameter: String::new(), signature: Signature::None })
+    }
+    StreamUrl::SignatureCipher(cipher) => parse_cipher(cipher),
+  }
 }
 
 fn parse_cipher(cipher: &str) -> Result<Cipher, CipherError> {
@@ -124,10 +135,7 @@ impl EjsCipherResolver {
     player_script_url: &Url,
     stream: &StreamUrl,
   ) -> Result<Url, CipherError> {
-    let cipher = match stream {
-      StreamUrl::Direct(url) => return Ok(url.clone()),
-      StreamUrl::SignatureCipher(cipher) => parse_cipher(cipher)?,
-    };
+    let cipher = cipher_for(stream)?;
     let (sigs, ns) = challenges(&cipher);
     debug!(
       "media URL parameters: signature={}, n={}",
@@ -148,15 +156,16 @@ impl EjsCipherResolver {
 
   /// Like [`Self::resolve`], but with the player script already in hand.
   pub fn resolve_with_script(&self, script: &str, stream: &StreamUrl) -> Result<Url, CipherError> {
-    let cipher = match stream {
-      StreamUrl::Direct(url) => return Ok(url.clone()),
-      StreamUrl::SignatureCipher(cipher) => parse_cipher(cipher)?,
-    };
+    let cipher = cipher_for(stream)?;
     let (sigs, ns) = challenges(&cipher);
+    if sigs.is_empty() && ns.is_empty() {
+      return assemble(cipher, &solver::Solved::default());
+    }
     assemble(cipher, &solver::solve(script, &sigs, &ns)?)
   }
 
-  async fn script(&self, player_script_url: &Url) -> Result<Arc<str>, CipherError> {
+  /// Downloads (or returns the cached copy of) the player script.
+  pub async fn script(&self, player_script_url: &Url) -> Result<Arc<str>, CipherError> {
     let player_id = player_cache_key(player_script_url);
     if let Some(script) = self.players.lock().expect("player cache lock poisoned").get(&player_id) {
       debug!("using cached player JavaScript for {player_id}");
@@ -178,11 +187,22 @@ impl EjsCipherResolver {
   }
 }
 
+/// Reads the player's `signatureTimestamp`.
+///
+/// The `player` request must send this value so the ciphers it returns match
+/// the player script we will solve them with.
+pub fn signature_timestamp(script: &str) -> Option<u32> {
+  const MARKER: &str = "signatureTimestamp:";
+  let rest = &script[script.find(MARKER)? + MARKER.len()..];
+  let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+  rest[..digits].parse().ok()
+}
+
 /// The `s` and `n` values this cipher needs solved.
 fn challenges(cipher: &Cipher) -> (Vec<String>, Vec<String>) {
   let sigs = match &cipher.signature {
     Signature::Encrypted(s) => vec![s.clone()],
-    Signature::Ready(_) => vec![],
+    Signature::Ready(_) | Signature::None => vec![],
   };
   (sigs, query_value(&cipher.url, "n").into_iter().collect())
 }
@@ -195,10 +215,13 @@ fn challenges(cipher: &Cipher) -> (Vec<String>, Vec<String>) {
 fn assemble(cipher: Cipher, solved: &solver::Solved) -> Result<Url, CipherError> {
   let Cipher { mut url, parameter, signature } = cipher;
   let signature = match signature {
-    Signature::Ready(ready) => ready,
-    Signature::Encrypted(s) => solved.sig.get(&s).cloned().ok_or(CipherError::Unsolved)?,
+    Signature::None => None,
+    Signature::Ready(ready) => Some(ready),
+    Signature::Encrypted(s) => Some(solved.sig.get(&s).cloned().ok_or(CipherError::Unsolved)?),
   };
-  url.query_pairs_mut().append_pair(&parameter, &signature);
+  if let Some(signature) = signature {
+    url.query_pairs_mut().append_pair(&parameter, &signature);
+  }
   if let Some(n) = query_value(&url, "n") {
     let transformed = solved.n.get(&n).ok_or(CipherError::Unsolved)?;
     replace_query_value(&mut url, "n", transformed);
@@ -222,6 +245,32 @@ fn player_cache_key(url: &Url) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn reads_signature_timestamp() {
+    let script = include_str!("../../tests/fixtures/players/8ab5c328.js");
+    assert_eq!(signature_timestamp(script), Some(20725));
+    assert_eq!(signature_timestamp("a={signatureTimestamp:19999,b:1}"), Some(19999));
+    assert_eq!(signature_timestamp("signatureTimestamp:abc"), None);
+    assert_eq!(signature_timestamp("nothing here"), None);
+  }
+
+  #[test]
+  fn direct_url_without_n_is_returned_unchanged() {
+    let url = Url::parse("https://example.test/a?x=1").unwrap();
+    let resolved =
+      EjsCipherResolver::new().resolve_with_script("", &StreamUrl::Direct(url.clone())).unwrap();
+    assert_eq!(resolved, url);
+  }
+
+  #[test]
+  fn direct_url_with_n_gets_n_solved() {
+    let script = include_str!("../../tests/fixtures/players/8ab5c328.js");
+    let url = Url::parse("https://example.test/a?x=1&n=abcdefghijk").unwrap();
+    let resolved =
+      EjsCipherResolver::new().resolve_with_script(script, &StreamUrl::Direct(url)).unwrap();
+    assert_eq!(resolved.query(), Some("x=1&n=VXuZqhSdiY"));
+  }
 
   #[test]
   fn parses_encrypted_cipher() {

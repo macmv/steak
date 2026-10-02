@@ -23,6 +23,11 @@ pub struct BootstrapData {
 }
 
 impl BootstrapData {
+  /// The player script URL from the Music page config, if it advertised one.
+  pub fn script_url(&self) -> Option<reqwest::Url> {
+    self.player_script_url.as_deref().and_then(|url| reqwest::Url::parse(url).ok())
+  }
+
   /// Applies the request-related values to a Music client configuration.
   pub fn apply_to(&self, config: &mut MusicClientConfig) {
     config.api_key = Some(self.api_key.clone());

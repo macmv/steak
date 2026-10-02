@@ -222,7 +222,21 @@ impl MusicClient {
   }
 
   pub async fn player(&self, video_id: impl Into<String>) -> reqwest::Result<Value> {
-    self.call(Endpoint::Player, player_body(video_id.into(), None, None)).await
+    self.player_with_signature_timestamp(video_id, None).await
+  }
+
+  /// Fetches player data, telling YouTube which player script's ciphers to
+  /// return (see `playback::player_script::signature_timestamp`).
+  pub async fn player_with_signature_timestamp(
+    &self,
+    video_id: impl Into<String>,
+    signature_timestamp: Option<u32>,
+  ) -> reqwest::Result<Value> {
+    let mut body = player_body(video_id.into(), None, None);
+    if let Some(timestamp) = signature_timestamp {
+      body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"] = timestamp.into();
+    }
+    self.call(Endpoint::Player, body).await
   }
 
   /// Fetches queue/watch-page data using navigation state from a result row.
@@ -303,6 +317,12 @@ mod tests {
   fn endpoint_paths_are_music_paths() {
     assert_eq!(Endpoint::SearchSuggestions.path(), "music/get_search_suggestions");
     assert_eq!(Endpoint::Queue.path(), "music/get_queue");
+  }
+
+  #[test]
+  fn player_body_has_a_playback_context_to_attach_the_timestamp_to() {
+    let body = player_body("id".into(), None, None);
+    assert!(body["playbackContext"]["contentPlaybackContext"].is_object());
   }
 
   #[test]
