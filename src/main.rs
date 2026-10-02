@@ -11,7 +11,7 @@ use st_api::{
   },
   media::audio::{AudioClient, AudioRequest},
   playback::{
-    player_script::{BoaCipherResolver, StreamUrl},
+    player_script::{EjsCipherResolver, StreamUrl},
     response::{AudioQuality, PlayerParser, StandardPlayerParser},
   },
 };
@@ -184,7 +184,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         url
       };
       let script_url = script_url.ok_or("no player JavaScript URL was advertised")?;
-      BoaCipherResolver::new().resolve(&script_url, &stream).await?
+      EjsCipherResolver::new().resolve(&script_url, &stream).await?
     }
   };
 

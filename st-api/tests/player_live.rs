@@ -10,7 +10,7 @@ use st_api::{
     client::{MusicClient, MusicClientConfig},
   },
   playback::{
-    player_script::{BoaCipherResolver, StreamUrl},
+    player_script::{EjsCipherResolver, StreamUrl},
     response::{AudioQuality, PlayerParser, StandardPlayerParser},
   },
 };
@@ -59,7 +59,7 @@ async fn search_result_has_an_audio_format_in_its_player_response() {
       .or(bootstrapper.player_script_url(&track.video_id).await.unwrap())
       .expect("watch page must advertise its JavaScript URL for ciphered formats");
     let resolved =
-      BoaCipherResolver::new().resolve(&script_url, &selected.stream_url).await.unwrap();
+      EjsCipherResolver::new().resolve(&script_url, &selected.stream_url).await.unwrap();
     assert!(resolved.query_pairs().any(|(key, _)| key == "signature" || key == "sig"));
     let n = resolved.query_pairs().find(|(key, _)| key == "n").map(|(_, value)| value.into_owned());
     assert!(n.is_some(), "resolved media URL must retain a transformed n parameter");
