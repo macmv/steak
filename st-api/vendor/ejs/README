@@ -1,0 +1,8 @@
+Vendored from yt-dlp-ejs 0.8.0 (https://github.com/yt-dlp/ejs), Unlicense.
+
+core.min.js is unmodified.
+
+lib.min.js differs from upstream in one mechanical way: its 2169 non-ASCII
+characters (an HTML named-entity table inside string literals) are rewritten as
+\uXXXX escapes, so the repo stays ASCII-only. The JS meaning is unchanged.
+  upstream lib.min.js sha256: c55987fe697e5b9ee18830163f7af85327e9bb5c3e674b969d38c8d205eaa577
