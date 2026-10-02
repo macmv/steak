@@ -124,10 +124,16 @@ fn setup_logging() -> Result<(), log::SetLoggerError> {
     .ok()
     .and_then(|value| value.parse().ok())
     .unwrap_or(log::LevelFilter::Debug);
+  let start = std::time::Instant::now();
   fern::Dispatch::new()
     .level(level)
-    .format(|out, message, record| {
-      out.finish(format_args!("[{} {}] {message}", record.level(), record.target()))
+    .format(move |out, message, record| {
+      out.finish(format_args!(
+        "[{:>7.3}s {} {}] {message}",
+        start.elapsed().as_secs_f64(),
+        record.level(),
+        record.target()
+      ))
     })
     .chain(std::io::stderr())
     .apply()
