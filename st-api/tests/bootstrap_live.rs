@@ -3,7 +3,7 @@
 //! Run explicitly because the page and its network availability are external:
 //! `cargo test -p st-api --test bootstrap_live -- --ignored`
 
-use st_api::bootstrap::{Bootstrapper, WebBootstrapper};
+use st_api::innertube::bootstrap::{Bootstrapper, WebBootstrapper};
 
 #[tokio::test]
 #[ignore = "fetches the live YouTube Music bootstrap page"]

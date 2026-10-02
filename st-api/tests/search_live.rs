@@ -3,9 +3,11 @@
 //! Run explicitly with `cargo test -p st-api --test search_live -- --ignored`.
 
 use st_api::{
-  bootstrap::{Bootstrapper, WebBootstrapper},
   catalog::SearchParser,
-  music::{MusicClient, MusicClientConfig},
+  innertube::{
+    bootstrap::{Bootstrapper, WebBootstrapper},
+    client::{MusicClient, MusicClientConfig},
+  },
 };
 
 #[tokio::test]

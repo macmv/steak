@@ -1,6 +1,6 @@
 //! Conversion of Music search renderer trees into stable catalog objects.
 
-use crate::music::WatchEndpoint;
+use crate::innertube::client::WatchEndpoint;
 use serde_json::Value;
 
 /// A track returned by YouTube Music search.

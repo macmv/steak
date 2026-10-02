@@ -4,10 +4,8 @@
 //! exposes its responses as JSON at the boundary, so renderer-tree changes do
 //! not leak into the application's domain model.
 
-pub mod audio;
-pub mod auth;
-pub mod bootstrap;
+pub mod account;
 pub mod catalog;
-pub mod cipher;
-pub mod music;
-pub mod player;
+pub mod innertube;
+pub mod media;
+pub mod playback;

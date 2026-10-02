@@ -3,7 +3,7 @@
 //! The bootstrapper fetches the Music landing page and extracts its current
 //! Innertube configuration and preserves anonymous cookies from that response.
 
-use crate::music::MusicClientConfig;
+use crate::innertube::client::MusicClientConfig;
 use log::{debug, warn};
 use reqwest::{Client, header};
 use serde_json::{Map, Value};

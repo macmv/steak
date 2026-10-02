@@ -1,6 +1,6 @@
 //! Player-response and audio-format data contracts.
 
-use crate::cipher::StreamUrl;
+use crate::playback::player_script::StreamUrl;
 use log::{debug, warn};
 
 /// The selected audio stream, ready for cipher resolution and playback.

@@ -5,11 +5,15 @@ use clap::{Args, Parser, Subcommand};
 use futures_util::{Stream, StreamExt};
 use log::{debug, error, info, warn};
 use st_api::{
-  audio::{AudioClient, AudioRequest},
-  bootstrap::{Bootstrapper, WebBootstrapper},
-  cipher::{BoaCipherResolver, StreamUrl},
-  music::{MusicClient, MusicClientConfig},
-  player::{AudioQuality, PlayerParser, StandardPlayerParser},
+  innertube::{
+    bootstrap::{Bootstrapper, WebBootstrapper},
+    client::{MusicClient, MusicClientConfig},
+  },
+  media::audio::{AudioClient, AudioRequest},
+  playback::{
+    player_script::{BoaCipherResolver, StreamUrl},
+    response::{AudioQuality, PlayerParser, StandardPlayerParser},
+  },
 };
 use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc};
 
@@ -151,7 +155,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   debug!("received current YouTube Music client configuration");
   let mut config = MusicClientConfig::default();
   bootstrap.apply_to(&mut config);
-  let session = st_api::auth::StoredSession::load(&st_api::auth::session_path())?;
+  let session =
+    st_api::account::session::StoredSession::load(&st_api::account::session::session_path())?;
   config.headers.extend(session.auth_session().request_headers());
 
   let player_response = MusicClient::new(config).player(&video_id).await?;
@@ -192,8 +197,8 @@ fn auth_command(
   firefox_profile: &std::path::Path,
   output: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-  let session = st_api::auth::import_firefox_profile(firefox_profile)?;
-  let output = output.unwrap_or_else(st_api::auth::session_path);
+  let session = st_api::account::session::import_firefox_profile(firefox_profile)?;
+  let output = output.unwrap_or_else(st_api::account::session::session_path);
   session.save(&output)?;
   eprintln!("Imported YouTube session to {}. Keep it private.", output.display());
   Ok(())
