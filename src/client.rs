@@ -3,7 +3,7 @@
 //! This is the only way either of them reaches the outside world: a Unix
 //! socket to the daemon. Nothing here knows about YouTube.
 
-use std::{error::Error, io::ErrorKind, time::Duration};
+use std::{error::Error, io::ErrorKind, path::Path, time::Duration};
 
 use st_proto::ipc::{PlayerView, Request, Response, socket_path};
 use tokio::{
@@ -22,9 +22,8 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(230);
 /// Saving a track can take as long as the download does.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 
-async fn connect(request: &Request) -> Result<UnixStream, BoxError> {
-  let socket = socket_path();
-  let connect = tokio::time::timeout(Duration::from_secs(3), UnixStream::connect(&socket)).await;
+async fn connect(socket: &Path, request: &Request) -> Result<UnixStream, BoxError> {
+  let connect = tokio::time::timeout(Duration::from_secs(3), UnixStream::connect(socket)).await;
   let mut stream = match connect {
     Ok(Ok(stream)) => stream,
     Ok(Err(error))
@@ -47,11 +46,16 @@ async fn connect(request: &Request) -> Result<UnixStream, BoxError> {
 
 /// Sends one request to the daemon. A `Response::Error` becomes an `Err`.
 pub async fn call(request: Request) -> Result<Response, BoxError> {
+  call_at(&socket_path(), request).await
+}
+
+/// [`call`], to the daemon listening on `socket`.
+pub async fn call_at(socket: &Path, request: Request) -> Result<Response, BoxError> {
   let limit = match request {
     Request::Download { .. } => DOWNLOAD_TIMEOUT,
     _ => RESPONSE_TIMEOUT,
   };
-  let mut stream = connect(&request).await?;
+  let mut stream = connect(socket, &request).await?;
   stream.shutdown().await?;
 
   let mut reply = Vec::new();
@@ -72,8 +76,11 @@ pub struct Subscription {
 }
 
 /// Starts watching the player. The first `next` is its current state.
-pub async fn subscribe() -> Result<Subscription, BoxError> {
-  let stream = connect(&Request::Subscribe).await?;
+pub async fn subscribe() -> Result<Subscription, BoxError> { subscribe_at(&socket_path()).await }
+
+/// [`subscribe`], to the daemon listening on `socket`.
+pub async fn subscribe_at(socket: &Path) -> Result<Subscription, BoxError> {
+  let stream = connect(socket, &Request::Subscribe).await?;
   let (reader, writer) = stream.into_split();
   Ok(Subscription { lines: BufReader::new(reader).lines(), _writer: writer })
 }

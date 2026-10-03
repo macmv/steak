@@ -6,6 +6,8 @@
 
 mod client;
 mod daemon;
+#[cfg(test)]
+mod integration_test;
 mod tui;
 
 use std::{error::Error, path::PathBuf};

@@ -29,7 +29,7 @@ use tokio::{
 
 use super::{
   Daemon,
-  audio::{self, AbortOnDrop},
+  audio::AbortOnDrop,
   machine::{Effect, Event, Input, State, reduce},
 };
 
@@ -109,8 +109,11 @@ impl Actor {
         tokio::spawn(async move {
           let result = match daemon.upgrade() {
             Some(daemon) => {
-              match tokio::time::timeout(LOAD_QUEUE_TIMEOUT, daemon.load_queue(&source, token))
-                .await
+              match tokio::time::timeout(
+                LOAD_QUEUE_TIMEOUT,
+                daemon.backend().load_queue(&source, token),
+              )
+              .await
               {
                 Ok(result) => result.map_err(|error| error.to_string()),
                 Err(_) => Err(format!("loading the queue took longer than {LOAD_QUEUE_TIMEOUT:?}")),
@@ -156,12 +159,13 @@ impl Actor {
         let (events, pid) = (events.clone(), job_pid.clone());
         async move {
           let daemon = daemon.upgrade().ok_or("the daemon is shutting down")?;
-          let audio = daemon.open_audio(&video_id).await.map_err(|error| error.to_string())?;
-          audio::play_stream(audio, |child| {
+          let backend = daemon.backend();
+          let audio = backend.open_audio(&video_id).await.map_err(|error| error.to_string())?;
+          let on_started = Box::new(move |child: Option<u32>| {
             pid.store(child.unwrap_or(0), Ordering::SeqCst);
             let _ = events.send(Input::Event(Event::AudioStarted { generation }));
-          })
-          .await
+          });
+          backend.play(audio, on_started).await
         }
       }));
       let event = match (&mut job.0).await {

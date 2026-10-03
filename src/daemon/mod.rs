@@ -59,45 +59,34 @@ use std::{
   time::{Duration, Instant},
 };
 
-use futures_util::FutureExt;
 use log::{error, info, warn};
 
-use caches::Caches;
+use api::Backend;
 use player::Player;
-use session::Session;
 use st_proto::ipc::{Command, Request, Response, StatusReport};
 
 /// How often the keeper starts due refreshes and repairs.
 const KEEPER_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct Daemon {
-  pub caches:  Arc<Caches>,
-  pub session: Arc<Session>,
-  pub player:  Player,
-  art:         art::ArtCache,
-  started:     Instant,
+  backend:    Arc<dyn Backend>,
+  pub player: Player,
+  started:    Instant,
 }
 
 impl Daemon {
-  pub fn new() -> Arc<Self> {
-    let caches = Caches::new(st_api::http_client());
-    let verifier: session::Verifier = {
-      let caches = caches.clone();
-      Arc::new(move |session| {
-        let caches = caches.clone();
-        async move { caches.verify(&session).await }.boxed()
-      })
-    };
-    let session = Session::new(config::Config::load(), verifier);
-    // The player reaches YouTube through the daemon, which owns the player.
+  /// A daemon on top of `backend`: the real one is [`api::YouTube`].
+  pub fn new(backend: Arc<dyn Backend>) -> Arc<Self> {
+    // The player reaches the outside world through the daemon, which owns the
+    // player.
     Arc::new_cyclic(|me| Self {
-      caches,
-      session,
+      backend,
       player: Player::spawn(me.clone()),
-      art: art::ArtCache::default(),
       started: Instant::now(),
     })
   }
+
+  pub fn backend(&self) -> &dyn Backend { &*self.backend }
 
   pub async fn handle(self: Arc<Self>, request: Request) -> Response {
     fn failed(error: impl std::fmt::Display) -> Response { Response::Error(error.to_string()) }
@@ -105,32 +94,34 @@ impl Daemon {
     match request {
       Request::Ping => Response::Pong,
       Request::Status => Response::Status(self.status()),
-      Request::Home { more } => match self.home(more).await {
+      Request::Home { more } => match self.backend.home(more).await {
         Ok((shelves, logged_in)) => Response::Home { shelves, logged_in },
         Err(error) => failed(error),
       },
-      Request::Radio { video_id, more } => match self.radio(&video_id, more).await {
+      Request::Radio { video_id, more } => match self.backend.radio(&video_id, more).await {
         Ok(tracks) => Response::Tracks(tracks),
         Err(error) => failed(error),
       },
-      Request::Playlist { playlist_id, more } => match self.playlist(&playlist_id, more).await {
-        Ok(tracks) => Response::Tracks(tracks),
-        Err(error) => failed(error),
-      },
+      Request::Playlist { playlist_id, more } => {
+        match self.backend.playlist(&playlist_id, more).await {
+          Ok(tracks) => Response::Tracks(tracks),
+          Err(error) => failed(error),
+        }
+      }
       Request::Control(command) => {
         self.player.command(command);
         Response::Ok
       }
       // Streaming a connection is the server's job; see `server::connection`.
       Request::Subscribe => Response::Player(self.player.view()),
-      Request::Art { url } => match self.art.fetch(&self.caches.http, &url).await {
+      Request::Art { url } => match self.backend.art(&url).await {
         Ok(image) => Response::Art(image),
         Err(error) => failed(error),
       },
       Request::Download { video_id, output } => {
         info!("downloading {video_id} to {}", output.display());
-        let result = match self.open_audio(&video_id).await {
-          Ok(audio) => download::save(audio, &output).await,
+        let result = match self.backend.open_audio(&video_id).await {
+          Ok(audio) => self.backend.save(audio, &output).await,
           Err(error) => Err(error.to_string()),
         };
         match result {
@@ -138,22 +129,11 @@ impl Daemon {
           Err(error) => failed(error),
         }
       }
-      Request::AuthImport { profile } => {
-        let result = match profile.or_else(|| self.session.source()) {
-          Some(profile) => self.session.set_profile(profile).await,
-          None => Err(session::SessionError(
-            "no Firefox profile found; pass the profile directory".into(),
-          )),
-        };
-        match result {
-          Ok(()) => Response::Session(self.session.report()),
-          Err(error) => failed(error),
-        }
-      }
-      Request::AuthRepair => {
-        self.session.repair_now().await;
-        Response::Session(self.session.report())
-      }
+      Request::AuthImport { profile } => match self.backend.import_session(profile).await {
+        Ok(report) => Response::Session(report),
+        Err(error) => failed(error),
+      },
+      Request::AuthRepair => Response::Session(self.backend.repair_session().await),
     }
   }
 
@@ -162,16 +142,13 @@ impl Daemon {
       version:     env!("CARGO_PKG_VERSION").into(),
       uptime_secs: self.started.elapsed().as_secs(),
       player:      self.player.view(),
-      session:     self.session.report(),
-      caches:      self.caches.reports(),
+      session:     self.backend.session_report(),
+      caches:      self.backend.cache_reports(),
     }
   }
 
   /// One round of background upkeep. Starts work; never waits for it.
-  fn keep(&self) {
-    self.caches.maintain();
-    self.session.maintain();
-  }
+  fn keep(&self) { self.backend.maintain(); }
 }
 
 /// Runs the daemon until it is told to stop.
@@ -180,7 +157,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
   let listener = server::bind(&socket).await?;
   info!("steak daemon {} listening on {}", env!("CARGO_PKG_VERSION"), socket.display());
 
-  let daemon = Daemon::new();
+  let daemon = Daemon::new(Arc::new(api::YouTube::new()));
   watchdog(Duration::from_secs(10), Duration::from_secs(60));
   {
     let daemon = daemon.clone();

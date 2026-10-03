@@ -1,17 +1,29 @@
 //! What the daemon does for a client: the operations behind each request.
 //!
-//! These only assemble the pieces. Credentials come from [`Session`], cached
-//! web app state from [`Caches`], and each reports its own failures; this layer
-//! decides when a failure means "rebuild and try once more".
+//! Everything the daemon needs from outside the process (YouTube, the audio
+//! device, ffmpeg) sits behind the [`Backend`] trait, so the daemon itself is
+//! plain plumbing that can run against a fake in tests. [`YouTube`] is the real
+//! backend.
+//!
+//! [`YouTube`] only assembles the pieces. Credentials come from [`Session`],
+//! cached web app state from [`Caches`], and each reports its own failures;
+//! this layer decides when a failure means "rebuild and try once more".
 
-use std::{error::Error, time::Duration};
+use std::{
+  error::Error,
+  future::Future,
+  path::{Path, PathBuf},
+  pin::Pin,
+  sync::Arc,
+  time::Duration,
+};
 
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
+use futures_util::{FutureExt, Stream, StreamExt};
 use log::{info, warn};
 use st_api::{
   Url,
-  catalog::{HomeParser, PlaylistParser, QueueParser, Shelf, Track},
+  catalog::{HomeParser, PlaylistParser, QueueParser},
   media::audio::{AudioClient, AudioRequest},
   playback::{
     access::po_token::authorize_stream,
@@ -20,11 +32,67 @@ use st_api::{
   },
 };
 
-use st_proto::ipc::Source;
+use st_proto::{
+  catalog::{Shelf, Track},
+  ipc::{CellReport, SessionReport, Source},
+};
 
-use super::{Daemon, machine::Batch};
+use super::{
+  art::ArtCache,
+  audio,
+  caches::Caches,
+  download,
+  machine::Batch,
+  session::{Session, SessionError, Verifier},
+};
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
+
+/// A boxed future that may borrow from the backend.
+pub type Fut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Called once the audio is audible, with the process ID to signal for
+/// pause/resume (if there is a process).
+pub type OnStarted = Box<dyn FnOnce(Option<u32>) + Send>;
+
+/// Everything the daemon needs from the outside world.
+pub trait Backend: Send + Sync + 'static {
+  /// The homepage shelves, and whether YouTube served them to a signed-in
+  /// account.
+  fn home(&self, more: u32) -> Fut<'_, Result<(Vec<Shelf>, bool), BoxError>>;
+  fn radio<'a>(&'a self, video_id: &'a str, more: u32) -> Fut<'a, Result<Vec<Track>, BoxError>>;
+  fn playlist<'a>(
+    &'a self,
+    playlist_id: &'a str,
+    more: u32,
+  ) -> Fut<'a, Result<Vec<Track>, BoxError>>;
+  /// One batch of a player queue: the first (`token: None`) or the one after
+  /// `token`.
+  fn load_queue<'a>(
+    &'a self,
+    source: &'a Source,
+    token: Option<String>,
+  ) -> Fut<'a, Result<Batch, BoxError>>;
+  /// Opens the audio of `video_id` as a stream of chunks.
+  fn open_audio<'a>(&'a self, video_id: &'a str) -> Fut<'a, Result<AudioChunks, BoxError>>;
+  /// The bytes of an image (album art).
+  fn art<'a>(&'a self, url: &'a str) -> Fut<'a, Result<Vec<u8>, BoxError>>;
+
+  /// Plays `audio` out loud and returns when it has finished. Dropping the
+  /// future stops the playback.
+  fn play(&self, audio: AudioChunks, on_started: OnStarted) -> Fut<'_, Result<(), String>>;
+  /// Saves `audio` as an mp4 file at `output`.
+  fn save<'a>(&'a self, audio: AudioChunks, output: &'a Path) -> Fut<'a, Result<(), String>>;
+
+  fn session_report(&self) -> SessionReport;
+  /// Imports the session from a Firefox profile (or the default one).
+  fn import_session(&self, profile: Option<PathBuf>) -> Fut<'_, Result<SessionReport, String>>;
+  /// Re-imports the session and verifies it.
+  fn repair_session(&self) -> Fut<'_, SessionReport>;
+  fn cache_reports(&self) -> Vec<CellReport>;
+  /// One round of background upkeep. Starts work; never waits for it.
+  fn maintain(&self);
+}
 
 /// The audio of one track, as it downloads.
 pub type AudioChunks = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>;
@@ -35,10 +103,98 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(150);
 const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(150);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 
-impl Daemon {
-  /// The homepage shelves, and whether YouTube served them to a signed-in
-  /// account.
-  pub async fn home(&self, more: u32) -> Result<(Vec<Shelf>, bool), BoxError> {
+/// The real backend: YouTube Music, `ffplay` and `ffmpeg`.
+pub struct YouTube {
+  pub caches:  Arc<Caches>,
+  pub session: Arc<Session>,
+  art:         ArtCache,
+}
+
+impl YouTube {
+  pub fn new() -> Self {
+    let caches = Caches::new(st_api::http_client());
+    let verifier: Verifier = {
+      let caches = caches.clone();
+      Arc::new(move |session| {
+        let caches = caches.clone();
+        async move { caches.verify(&session).await }.boxed()
+      })
+    };
+    let session = Session::new(super::config::Config::load(), verifier);
+    Self { caches, session, art: ArtCache::default() }
+  }
+}
+
+impl Backend for YouTube {
+  fn home(&self, more: u32) -> Fut<'_, Result<(Vec<Shelf>, bool), BoxError>> {
+    Box::pin(self.fetch_home(more))
+  }
+
+  fn radio<'a>(&'a self, video_id: &'a str, more: u32) -> Fut<'a, Result<Vec<Track>, BoxError>> {
+    Box::pin(self.fetch_radio(video_id, more))
+  }
+
+  fn playlist<'a>(
+    &'a self,
+    playlist_id: &'a str,
+    more: u32,
+  ) -> Fut<'a, Result<Vec<Track>, BoxError>> {
+    Box::pin(self.fetch_playlist(playlist_id, more))
+  }
+
+  fn load_queue<'a>(
+    &'a self,
+    source: &'a Source,
+    token: Option<String>,
+  ) -> Fut<'a, Result<Batch, BoxError>> {
+    Box::pin(self.fetch_queue(source, token))
+  }
+
+  fn open_audio<'a>(&'a self, video_id: &'a str) -> Fut<'a, Result<AudioChunks, BoxError>> {
+    Box::pin(self.fetch_audio(video_id))
+  }
+
+  fn art<'a>(&'a self, url: &'a str) -> Fut<'a, Result<Vec<u8>, BoxError>> {
+    Box::pin(self.art.fetch(&self.caches.http, url))
+  }
+
+  fn play(&self, audio: AudioChunks, on_started: OnStarted) -> Fut<'_, Result<(), String>> {
+    Box::pin(audio::play_stream(audio, on_started))
+  }
+
+  fn save<'a>(&'a self, audio: AudioChunks, output: &'a Path) -> Fut<'a, Result<(), String>> {
+    Box::pin(download::save(audio, output))
+  }
+
+  fn session_report(&self) -> SessionReport { self.session.report() }
+
+  fn import_session(&self, profile: Option<PathBuf>) -> Fut<'_, Result<SessionReport, String>> {
+    Box::pin(async move {
+      let result = match profile.or_else(|| self.session.source()) {
+        Some(profile) => self.session.set_profile(profile).await,
+        None => Err(SessionError("no Firefox profile found; pass the profile directory".into())),
+      };
+      result.map(|()| self.session.report()).map_err(|error| error.to_string())
+    })
+  }
+
+  fn repair_session(&self) -> Fut<'_, SessionReport> {
+    Box::pin(async move {
+      self.session.repair_now().await;
+      self.session.report()
+    })
+  }
+
+  fn cache_reports(&self) -> Vec<CellReport> { self.caches.reports() }
+
+  fn maintain(&self) {
+    self.caches.maintain();
+    self.session.maintain();
+  }
+}
+
+impl YouTube {
+  async fn fetch_home(&self, more: u32) -> Result<(Vec<Shelf>, bool), BoxError> {
     let parser = HomeParser;
     // If YouTube serves a signed-out page the session is bad: report it, which
     // starts a repair, and try once more with whatever the repair produced.
@@ -66,7 +222,7 @@ impl Daemon {
   }
 
   /// The song radio YouTube Music builds from `video_id`.
-  pub async fn radio(&self, video_id: &str, more: u32) -> Result<Vec<Track>, BoxError> {
+  async fn fetch_radio(&self, video_id: &str, more: u32) -> Result<Vec<Track>, BoxError> {
     let (client, _) = self.client().await?;
     let parser = QueueParser;
     let mut response = client.next(video_id, Some(format!("RDAMVM{video_id}"))).await?;
@@ -87,7 +243,7 @@ impl Daemon {
   }
 
   /// The tracks of a playlist or album.
-  pub async fn playlist(&self, playlist_id: &str, more: u32) -> Result<Vec<Track>, BoxError> {
+  async fn fetch_playlist(&self, playlist_id: &str, more: u32) -> Result<Vec<Track>, BoxError> {
     let (client, _) = self.client().await?;
     let parser = PlaylistParser;
     // Browse IDs are the playlist ID behind a `VL` prefix.
@@ -111,11 +267,7 @@ impl Daemon {
 
   /// One batch of a player queue: the first (`token: None`) or the one after
   /// `token`.
-  pub async fn load_queue(
-    &self,
-    source: &Source,
-    token: Option<String>,
-  ) -> Result<Batch, BoxError> {
+  async fn fetch_queue(&self, source: &Source, token: Option<String>) -> Result<Batch, BoxError> {
     let (client, _) = self.client().await?;
     match source {
       Source::None => Err("this queue does not grow".into()),
@@ -143,7 +295,7 @@ impl Daemon {
 
   /// Resolves `video_id` to a signed URL that googlevideo serves in full, and
   /// opens it as a stream of chunks.
-  pub async fn open_audio(&self, video_id: &str) -> Result<AudioChunks, BoxError> {
+  async fn fetch_audio(&self, video_id: &str) -> Result<AudioChunks, BoxError> {
     let url =
       timeout(RESOLVE_TIMEOUT, "resolving the stream", self.resolve_stream(video_id)).await??;
     // googlevideo refuses a stream past its first chunk unless it carries a
