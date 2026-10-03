@@ -6,7 +6,7 @@ use ratatui::{
   style::{Color, Style},
   widgets::{Block, Paragraph},
 };
-use st_api::catalog::{Shelf, ShelfItem, Track};
+use st_api::catalog::{Artist, Card, Shelf, ShelfItem, Track};
 
 use super::{Hit, Target, ui};
 
@@ -22,6 +22,33 @@ struct Column {
   offset:   usize,
 }
 
+/// Turns a card for a single song or video into a track. Cards that open a
+/// browse page (albums, playlists, artists) are not playable, so they give
+/// `None`.
+fn card_track(card: Card) -> Option<Track> {
+  if card.browse_id.is_some() {
+    return None;
+  }
+  let watch = card.watch?;
+  // Subtitles look like "Song \u{2022} Artist" or "730t \u{2022} 35K views".
+  let mut parts = card.subtitle.split(" \u{2022} ");
+  let kind = parts.next().unwrap_or_default();
+  let artists = if kind == "Song" {
+    parts.next().map(|name| Artist { id: None, name: name.to_owned() }).into_iter().collect()
+  } else {
+    Vec::new()
+  };
+  Some(Track {
+    video_id: watch.video_id.clone(),
+    title: card.title,
+    artists,
+    album: None,
+    duration: None,
+    thumbnails: Vec::new(),
+    watch: Some(watch),
+  })
+}
+
 #[derive(Default)]
 pub struct Home {
   columns:     Vec<Column>,
@@ -34,8 +61,8 @@ pub struct Home {
 impl Home {
   pub fn new() -> Self { Self { loading: true, ..Self::default() } }
 
-  /// Adds the shelves' tracks; shelves of albums and playlists have nothing to
-  /// play, so they are skipped.
+  /// Adds the shelves' tracks, including cards for single songs and videos;
+  /// albums and playlists have nothing to play directly, so they are skipped.
   pub fn add_shelves(&mut self, shelves: Vec<Shelf>) {
     for shelf in shelves {
       let tracks: Vec<Track> = shelf
@@ -43,7 +70,7 @@ impl Home {
         .into_iter()
         .filter_map(|item| match item {
           ShelfItem::Track(track) => Some(track),
-          ShelfItem::Card(_) => None,
+          ShelfItem::Card(card) => card_track(card),
         })
         .collect();
       if !tracks.is_empty() {
