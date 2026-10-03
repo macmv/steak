@@ -111,6 +111,7 @@ pub fn render_status_bar(
   frame.render_widget(
     LineGauge::default()
       .ratio(ratio)
+      .label("")
       .filled_style(Style::default().fg(Color::Green))
       .unfilled_style(Style::default().fg(Color::DarkGray)),
     bar,
