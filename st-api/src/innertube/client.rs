@@ -209,6 +209,12 @@ impl MusicClient {
     self.call(Endpoint::Browse, body).await
   }
 
+  /// Loads the next page of a browse response from its continuation token.
+  pub async fn browse_continuation(&self, token: impl Into<String>) -> reqwest::Result<Value> {
+    let body = Map::from_iter([(String::from("continuation"), Value::String(token.into()))]);
+    self.call(Endpoint::Browse, body).await
+  }
+
   pub async fn next(
     &self,
     video_id: impl Into<String>,

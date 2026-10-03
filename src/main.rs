@@ -7,6 +7,7 @@ use log::{debug, error, info, warn};
 use st_api::{
   Url,
   cache::Cache,
+  catalog::{HomeParser, ShelfItem},
   innertube::{
     bootstrap::{Bootstrapper, WebBootstrapper},
     client::{MusicClient, MusicClientConfig},
@@ -39,6 +40,12 @@ struct Cli {
 enum CliCommand {
   /// Manage the authenticated YouTube session used for playback.
   Auth(AuthCommand),
+  /// Show the YouTube Music homepage: "Quick picks", "Listen again", and so on.
+  Home {
+    /// Number of additional pages of shelves to load after the first.
+    #[arg(long, default_value_t = 0)]
+    more: u32,
+  },
 }
 
 #[derive(Debug, Args)]
@@ -248,13 +255,17 @@ enum Solve {
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   setup_logging()?;
   let cli = Cli::parse();
-  if let Some(CliCommand::Auth(auth)) = cli.command {
-    return match auth.command {
-      AuthSubcommand::ImportFirefox { firefox_profile, session_file } => {
-        auth_command(&firefox_profile, session_file)
-      }
-    };
-  };
+  match cli.command {
+    Some(CliCommand::Auth(auth)) => {
+      return match auth.command {
+        AuthSubcommand::ImportFirefox { firefox_profile, session_file } => {
+          auth_command(&firefox_profile, session_file)
+        }
+      };
+    }
+    Some(CliCommand::Home { more }) => return home_command(more).await,
+    None => {}
+  }
   let video_id =
     cli.video_id.ok_or("a YouTube video ID is required; run `steak --help` for usage")?;
   info!("starting playback request for YouTube video {video_id}");
@@ -294,5 +305,67 @@ fn auth_command(
   let output = output.unwrap_or_else(st_api::account::session::session_path);
   session.save(&output)?;
   eprintln!("Imported YouTube session to {}. Keep it private.", output.display());
+  Ok(())
+}
+
+/// Builds an authenticated Music client from the cached (or fresh) web app
+/// configuration and the stored session.
+async fn music_client(cache: &Cache) -> Result<MusicClient, Box<dyn Error + Send + Sync>> {
+  let bootstrap = match cache.bootstrap() {
+    Some(bootstrap) => bootstrap,
+    None => {
+      let bootstrap = WebBootstrapper::default().bootstrap().await?;
+      cache.store_bootstrap(&bootstrap);
+      bootstrap
+    }
+  };
+  let mut config = MusicClientConfig::default();
+  bootstrap.apply_to(&mut config);
+  let session =
+    st_api::account::session::StoredSession::load(&st_api::account::session::session_path())?;
+  config.headers.extend(session.auth_session().request_headers());
+  Ok(MusicClient::new(config))
+}
+
+async fn home_command(more: u32) -> Result<(), Box<dyn Error + Send + Sync>> {
+  let cache = Cache::open();
+  let client = music_client(&cache).await?;
+  let parser = HomeParser;
+
+  let mut response = client.browse("FEmusic_home", None).await?;
+  if !parser.logged_in(&response) {
+    warn!(
+      "YouTube treated this session as signed out, so the homepage is generic; re-import your \
+       session with `steak auth import-firefox`"
+    );
+  }
+  for page in 0..=more {
+    for shelf in parser.shelves(&response) {
+      println!("{}", shelf.title);
+      for item in shelf.items {
+        match item {
+          ShelfItem::Track(track) => {
+            let artists = track.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>();
+            println!("  {} -- {} [{}]", track.title, artists.join(", "), track.video_id);
+          }
+          ShelfItem::Card(card) => {
+            let id = card
+              .watch
+              .as_ref()
+              .map(|watch| watch.video_id.as_str())
+              .or(card.browse_id.as_deref())
+              .unwrap_or("?");
+            println!("  {} -- {} [{id}]", card.title, card.subtitle);
+          }
+        }
+      }
+      println!();
+    }
+    if page == more {
+      break;
+    }
+    let Some(token) = parser.continuation(&response) else { break };
+    response = client.browse_continuation(token).await?;
+  }
   Ok(())
 }
