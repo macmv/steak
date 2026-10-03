@@ -28,10 +28,6 @@ use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc};
 #[derive(Debug, Parser)]
 #[command(about = "Play a YouTube video's audio track")]
 struct Cli {
-  /// YouTube video ID to play.
-  #[arg(value_name = "YOUTUBE_VIDEO_ID")]
-  video_id: Option<String>,
-
   #[command(subcommand)]
   command: Option<CliCommand>,
 }
@@ -45,6 +41,11 @@ enum CliCommand {
     /// Number of additional pages of shelves to load after the first.
     #[arg(long, default_value_t = 0)]
     more: u32,
+  },
+
+  Play {
+    /// YouTube video ID to play.
+    video_id: String,
   },
 }
 
@@ -266,38 +267,41 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
       };
     }
+
     Some(CliCommand::Home { more }) => return home_command(&http, more).await,
+    Some(CliCommand::Play { video_id }) => {
+      info!("starting playback request for YouTube video {video_id}");
+
+      let cache = Cache::open();
+      let populated = cache.is_populated();
+      let stream_url = match resolve_stream(&http, &cache, &video_id).await {
+        Ok(url) => url,
+        // Something cached no longer works (YouTube rotated the player, say). Drop
+        // all of it and rebuild from scratch, once.
+        Err(error) if populated => {
+          warn!("cached state failed ({error}); clearing it and starting over");
+          cache.clear();
+          resolve_stream(&http, &cache, &video_id).await?
+        }
+        Err(error) => return Err(error),
+      };
+
+      // googlevideo refuses a stream past its first chunk unless it carries a
+      // valid PoToken. This is outside the cache fallback above on purpose: a
+      // PoToken failure says nothing about the cache.
+      let audio_client = AudioClient::new(http.clone());
+      let botguard = match std::env::var_os("STEAK_BOTGUARD") {
+        Some(binary) => BotguardCliProvider::new(binary),
+        None => BotguardCliProvider::default(),
+      };
+      let stream_url = authorize_stream(&botguard, &audio_client, stream_url, &video_id).await?;
+      let audio = audio_client.stream_chunked(AudioRequest::new(stream_url)).await?;
+      play(audio).await?;
+    }
     None => {}
   }
-  let video_id =
-    cli.video_id.ok_or("a YouTube video ID is required; run `steak --help` for usage")?;
-  info!("starting playback request for YouTube video {video_id}");
 
-  let cache = Cache::open();
-  let populated = cache.is_populated();
-  let stream_url = match resolve_stream(&http, &cache, &video_id).await {
-    Ok(url) => url,
-    // Something cached no longer works (YouTube rotated the player, say). Drop
-    // all of it and rebuild from scratch, once.
-    Err(error) if populated => {
-      warn!("cached state failed ({error}); clearing it and starting over");
-      cache.clear();
-      resolve_stream(&http, &cache, &video_id).await?
-    }
-    Err(error) => return Err(error),
-  };
-
-  // googlevideo refuses a stream past its first chunk unless it carries a
-  // valid PoToken. This is outside the cache fallback above on purpose: a
-  // PoToken failure says nothing about the cache.
-  let audio_client = AudioClient::new(http.clone());
-  let botguard = match std::env::var_os("STEAK_BOTGUARD") {
-    Some(binary) => BotguardCliProvider::new(binary),
-    None => BotguardCliProvider::default(),
-  };
-  let stream_url = authorize_stream(&botguard, &audio_client, stream_url, &video_id).await?;
-  let audio = audio_client.stream_chunked(AudioRequest::new(stream_url)).await?;
-  play(audio).await
+  Ok(())
 }
 
 fn auth_command(
