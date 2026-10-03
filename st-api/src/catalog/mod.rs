@@ -153,6 +153,91 @@ fn runs_text(runs: &Value) -> String {
     .collect()
 }
 
+/// Extracts a playlist's tracks from a `browse` response (or continuation).
+#[derive(Clone, Debug, Default)]
+pub struct PlaylistParser;
+
+impl PlaylistParser {
+  pub fn tracks(&self, response: &Value) -> Vec<Track> { SearchParser.tracks(response) }
+
+  /// The token that loads the next page of a long playlist, if there is one.
+  ///
+  /// The search is scoped to the track shelf: a playlist page also carries
+  /// continuations for its related-content sections, which are not tracks.
+  pub fn continuation(&self, response: &Value) -> Option<String> {
+    let mut shelves = Vec::new();
+    find_all(response, "musicPlaylistShelfRenderer", &mut shelves);
+    find_all(response, "musicPlaylistShelfContinuation", &mut shelves);
+    let scope = shelves.first().copied().unwrap_or(response);
+    find_object(scope, "continuationCommand")
+      .and_then(|command| command.get("token"))
+      .and_then(Value::as_str)
+      .or_else(|| find_object(scope, "nextContinuationData")?.get("continuation")?.as_str())
+      .map(str::to_owned)
+  }
+}
+
+/// Extracts an up-next queue, such as a song radio, from a `next` response (or
+/// continuation).
+#[derive(Clone, Debug, Default)]
+pub struct QueueParser;
+
+impl QueueParser {
+  pub fn tracks(&self, response: &Value) -> Vec<Track> {
+    let mut panels = Vec::new();
+    find_all(response, "playlistPanelRenderer", &mut panels);
+    // Continuations carry the same list under a different name.
+    find_all(response, "playlistPanelContinuation", &mut panels);
+    panels
+      .into_iter()
+      .filter_map(|panel| panel.get("contents")?.as_array())
+      .flatten()
+      .filter_map(|item| {
+        item.get("playlistPanelVideoRenderer").or_else(|| {
+          item.pointer(
+            "/playlistPanelVideoWrapperRenderer/primaryRenderer/playlistPanelVideoRenderer",
+          )
+        })
+      })
+      .filter_map(parse_queue_track)
+      .collect()
+  }
+
+  /// The token that loads the next batch of the queue, if there is one.
+  pub fn continuation(&self, response: &Value) -> Option<String> {
+    find_string(response, "continuation").map(str::to_owned)
+  }
+}
+
+fn find_all<'a>(value: &'a Value, key: &str, found: &mut Vec<&'a Value>) {
+  match value {
+    Value::Array(values) => values.iter().for_each(|value| find_all(value, key, found)),
+    Value::Object(object) => {
+      if let Some(value) = object.get(key) {
+        found.push(value);
+      } else {
+        object.values().for_each(|value| find_all(value, key, found));
+      }
+    }
+    _ => {}
+  }
+}
+
+fn parse_queue_track(row: &Value) -> Option<Track> {
+  let video_id = row.get("videoId")?.as_str()?;
+  let title = runs_text(row.pointer("/title/runs")?);
+  let byline: Vec<&Value> = row
+    .pointer("/longBylineText/runs")
+    .and_then(Value::as_array)
+    .map(|runs| runs.iter().collect())
+    .unwrap_or_default();
+  let (artists, album) = parse_byline(&byline).unwrap_or_default();
+  let duration = row.pointer("/lengthText/runs").map(runs_text);
+  let thumbnails = parse_thumbnails(row.pointer("/thumbnail/thumbnails"));
+  let watch = row.get("navigationEndpoint").and_then(find_watch_endpoint);
+  Some(Track { video_id: video_id.into(), title, artists, album, duration, thumbnails, watch })
+}
+
 fn find_music_rows<'a>(value: &'a Value, rows: &mut Vec<&'a Value>) {
   match value {
     Value::Array(values) => values.iter().for_each(|value| find_music_rows(value, rows)),
@@ -172,9 +257,21 @@ fn parse_track(row: &Value) -> Option<Track> {
   let video_id = find_string(row, "videoId")?;
   let watch = find_watch_endpoint(row);
   let metadata = columns.get(1).and_then(column_runs).unwrap_or_default();
+  let (artists, album) = parse_byline(&metadata)?;
+  let duration = row
+    .pointer("/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text/runs")
+    .map(runs_text);
+  let thumbnails =
+    parse_thumbnails(row.pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails"));
+  Some(Track { video_id: video_id.into(), title, artists, album, duration, thumbnails, watch })
+}
+
+/// Splits a "Artist, Artist • Album" run list into its linked artists and
+/// album.
+fn parse_byline(runs: &[&Value]) -> Option<(Vec<Artist>, Option<Album>)> {
   let mut artists = Vec::new();
   let mut album = None;
-  for run in &metadata {
+  for run in runs {
     let text = run.get("text").and_then(Value::as_str)?;
     let browse_id =
       run.pointer("/navigationEndpoint/browseEndpoint/browseId").and_then(Value::as_str);
@@ -184,13 +281,11 @@ fn parse_track(row: &Value) -> Option<Track> {
       artists.push(Artist { id: browse_id.map(str::to_owned), name: text.into() });
     }
   }
-  let duration = row
-    .get("fixedColumns")
-    .and_then(Value::as_array)
-    .and_then(|columns| columns.first())
-    .and_then(column_text);
-  let thumbnails = row
-    .pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
+  Some((artists, album))
+}
+
+fn parse_thumbnails(thumbnails: Option<&Value>) -> Vec<Thumbnail> {
+  thumbnails
     .and_then(Value::as_array)
     .into_iter()
     .flatten()
@@ -207,8 +302,7 @@ fn parse_track(row: &Value) -> Option<Track> {
           .and_then(|value| value.try_into().ok()),
       })
     })
-    .collect();
-  Some(Track { video_id: video_id.into(), title, artists, album, duration, thumbnails, watch })
+    .collect()
 }
 
 fn find_watch_endpoint(row: &Value) -> Option<WatchEndpoint> {
@@ -282,6 +376,7 @@ mod tests {
     assert_eq!(tracks[0].title, "Around the World");
     assert_eq!(tracks[0].artists[0].name, "Daft Punk");
     assert_eq!(tracks[0].album.as_ref().unwrap().name, "Homework");
+    assert_eq!(tracks[0].duration.as_deref(), Some("7:09"));
     assert_eq!(tracks[0].watch.as_ref().unwrap().playlist_id.as_deref(), Some("RDexample"));
   }
 
@@ -312,5 +407,46 @@ mod tests {
     assert_eq!(song.watch.as_ref().unwrap().video_id, "abc");
     assert_eq!(HomeParser.continuation(&response).as_deref(), Some("token"));
     assert!(HomeParser.logged_in(&response));
+  }
+
+  #[test]
+  fn extracts_queue_tracks_and_continuation() {
+    let response = serde_json::json!({"contents":{"playlistPanelRenderer":{
+      "contents":[
+        {"playlistPanelVideoWrapperRenderer":{"primaryRenderer":{"playlistPanelVideoRenderer":{
+          "videoId":"abc","title":{"runs":[{"text":"First"}]},
+          "longBylineText":{"runs":[
+            {"text":"Band","navigationEndpoint":{"browseEndpoint":{"browseId":"UCband"}}},
+            {"text":" \u{2022} "},
+            {"text":"Record","navigationEndpoint":{"browseEndpoint":{"browseId":"MPRErec"}}}]},
+          "lengthText":{"runs":[{"text":"3:34"}]},
+          "navigationEndpoint":{"watchEndpoint":{"videoId":"abc","playlistId":"RDAMVMabc"}}}}}},
+        {"playlistPanelVideoRenderer":{"videoId":"def","title":{"runs":[{"text":"Second"}]}}}
+      ],
+      "continuations":[{"nextRadioContinuationData":{"continuation":"more"}}]}}});
+    let tracks = QueueParser.tracks(&response);
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].artists[0].name, "Band");
+    assert_eq!(tracks[0].album.as_ref().unwrap().name, "Record");
+    assert_eq!(tracks[0].duration.as_deref(), Some("3:34"));
+    assert_eq!(tracks[0].watch.as_ref().unwrap().playlist_id.as_deref(), Some("RDAMVMabc"));
+    assert_eq!(tracks[1].video_id, "def");
+    assert_eq!(QueueParser.continuation(&response).as_deref(), Some("more"));
+  }
+
+  #[test]
+  fn playlist_continuation_reads_new_style_tokens() {
+    let response = serde_json::json!({"x":[{"continuationItemRenderer":{"continuationEndpoint":{
+      "continuationCommand":{"token":"tok"}}}}]});
+    assert_eq!(PlaylistParser.continuation(&response).as_deref(), Some("tok"));
+  }
+
+  #[test]
+  fn playlist_continuation_ignores_related_sections() {
+    let response = serde_json::json!({
+      "tracks":{"musicPlaylistShelfRenderer":{"contents":[]}},
+      "related":{"continuations":[{"nextContinuationData":{"continuation":"related"}}]}
+    });
+    assert_eq!(PlaylistParser.continuation(&response), None);
   }
 }

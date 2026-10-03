@@ -213,6 +213,12 @@ impl MusicClient {
     self.call(Endpoint::Browse, body).await
   }
 
+  /// Loads the next batch of a `next` queue from its continuation token.
+  pub async fn next_continuation(&self, token: impl Into<String>) -> reqwest::Result<Value> {
+    let body = Map::from_iter([(String::from("continuation"), Value::String(token.into()))]);
+    self.call(Endpoint::Next, body).await
+  }
+
   pub async fn next(
     &self,
     video_id: impl Into<String>,

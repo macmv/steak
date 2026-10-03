@@ -7,7 +7,7 @@ use log::{debug, error, info, warn};
 use st_api::{
   Url,
   cache::Cache,
-  catalog::{HomeParser, ShelfItem},
+  catalog::{HomeParser, PlaylistParser, QueueParser, ShelfItem, Track},
   innertube::{
     bootstrap::{Bootstrapper, WebBootstrapper},
     client::{MusicClient, MusicClientConfig},
@@ -41,6 +41,23 @@ enum CliCommand {
     /// Number of additional pages of shelves to load after the first.
     #[arg(long, default_value_t = 0)]
     more: u32,
+  },
+
+  /// List the auto-mix (song radio) YouTube Music builds from a song.
+  Radio {
+    /// YouTube video ID to start the radio from.
+    video_id: String,
+    /// Number of additional batches of tracks to load after the first.
+    #[arg(long, default_value_t = 0)]
+    more:     u32,
+  },
+  /// List the tracks of a playlist or album.
+  Playlist {
+    /// Playlist ID, or the browse ID shown by `steak home` (`VL...`).
+    playlist_id: String,
+    /// Number of additional pages of tracks to load after the first.
+    #[arg(long, default_value_t = 0)]
+    more:        u32,
   },
 
   Play {
@@ -269,6 +286,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     Some(CliCommand::Home { more }) => return home_command(&http, more).await,
+    Some(CliCommand::Radio { video_id, more }) => {
+      return radio_command(&http, &video_id, more).await;
+    }
+    Some(CliCommand::Playlist { playlist_id, more }) => {
+      return playlist_command(&http, &playlist_id, more).await;
+    }
     Some(CliCommand::Play { video_id }) => {
       info!("starting playback request for YouTube video {video_id}");
 
@@ -353,10 +376,7 @@ async fn home_command(
       println!("{}", shelf.title);
       for item in shelf.items {
         match item {
-          ShelfItem::Track(track) => {
-            let artists = track.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>();
-            println!("  {} -- {} [{}]", track.title, artists.join(", "), track.video_id);
-          }
+          ShelfItem::Track(track) => print_track(&track),
           ShelfItem::Card(card) => {
             let id = card
               .watch
@@ -370,6 +390,66 @@ async fn home_command(
       }
       println!();
     }
+    if page == more {
+      break;
+    }
+    let Some(token) = parser.continuation(&response) else { break };
+    response = client.browse_continuation(token).await?;
+  }
+  Ok(())
+}
+
+fn print_track(track: &Track) {
+  let artists = track.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>();
+  let duration = track.duration.as_deref().map(|d| format!(" {d}")).unwrap_or_default();
+  println!("  {} -- {} [{}]{duration}", track.title, artists.join(", "), track.video_id);
+}
+
+/// Lists the song radio for `video_id`: YouTube's `RDAMVM` playlist, which the
+/// web app opens when you start a mix from a song.
+async fn radio_command(
+  http: &st_api::Client,
+  video_id: &str,
+  more: u32,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+  let cache = Cache::open();
+  let client = music_client(http, &cache).await?;
+  let parser = QueueParser;
+
+  let mut response = client.next(video_id, Some(format!("RDAMVM{video_id}"))).await?;
+  for page in 0..=more {
+    let tracks = parser.tracks(&response);
+    if tracks.is_empty() && page == 0 {
+      return Err(format!("no radio found for {video_id}").into());
+    }
+    tracks.iter().for_each(print_track);
+    if page == more {
+      break;
+    }
+    let Some(token) = parser.continuation(&response) else { break };
+    response = client.next_continuation(token).await?;
+  }
+  Ok(())
+}
+
+async fn playlist_command(
+  http: &st_api::Client,
+  playlist_id: &str,
+  more: u32,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+  let cache = Cache::open();
+  let client = music_client(http, &cache).await?;
+  let parser = PlaylistParser;
+
+  // Browse IDs are the playlist ID behind a `VL` prefix.
+  let playlist_id = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
+  let mut response = client.browse(format!("VL{playlist_id}"), None).await?;
+  for page in 0..=more {
+    let tracks = parser.tracks(&response);
+    if tracks.is_empty() && page == 0 {
+      return Err(format!("no tracks found for playlist {playlist_id}").into());
+    }
+    tracks.iter().for_each(print_track);
     if page == more {
       break;
     }
