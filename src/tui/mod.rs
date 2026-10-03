@@ -155,9 +155,11 @@ impl App {
     mut rx: UnboundedReceiver<Msg>,
   ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut events = EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
     while !self.quit {
       terminal.draw(|frame| self.draw(frame))?;
+      // Redraw when the clock ticks over. Everything else redraws because a
+      // key or a message arrived.
+      let tick = self.player.until_next_second();
       tokio::select! {
         Some(event) = events.next() => match event? {
           Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
@@ -165,8 +167,12 @@ impl App {
           _ => {}
         },
         Some(msg) = rx.recv() => self.on_msg(msg),
-        // Redraws, so the clock moves.
-        _ = tick.tick() => {}
+        _ = async {
+          match tick {
+            Some(wait) => tokio::time::sleep(wait).await,
+            None => std::future::pending().await,
+          }
+        } => {}
       }
     }
     Ok(())

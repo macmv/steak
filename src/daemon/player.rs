@@ -21,7 +21,7 @@ use std::{
 };
 
 use log::{error, info, warn};
-use st_proto::ipc::{Command, PlayerView};
+use st_proto::ipc::{Command, PlayerView, Transport};
 use tokio::{
   sync::{mpsc, watch},
   task::JoinHandle,
@@ -39,7 +39,27 @@ const LOAD_QUEUE_TIMEOUT: Duration = Duration::from_secs(90);
 /// The handle to the player. Cheap to use from anywhere.
 pub struct Player {
   input: mpsc::UnboundedSender<Input>,
-  view:  watch::Receiver<PlayerView>,
+  view:  watch::Receiver<Published>,
+}
+
+/// A view and when it was taken. The view's position is only right at that
+/// moment, so a reader who looks later needs [`Published::current`].
+pub struct Published {
+  view: PlayerView,
+  at:   Instant,
+}
+
+impl Published {
+  fn new(view: PlayerView, at: Instant) -> Self { Self { view, at } }
+
+  /// The view with its position moved forward to now, if the clock is running.
+  pub fn current(&self) -> PlayerView {
+    let mut view = self.view.clone();
+    if view.transport == Transport::Playing {
+      view.position_ms += self.at.elapsed().as_millis() as u64;
+    }
+    view
+  }
 }
 
 impl Player {
@@ -48,7 +68,10 @@ impl Player {
   pub fn spawn(daemon: Weak<Daemon>) -> Self {
     let (input, inbox) = mpsc::unbounded_channel();
     let state = State::default();
-    let (published, view) = watch::channel(state.view(Instant::now()));
+    let (published, view) = watch::channel({
+      let now = Instant::now();
+      Published::new(state.view(now), now)
+    });
     let actor = Actor { state, daemon, events: input.clone(), published, job: None };
     tokio::spawn(actor.run(inbox));
     Self { input, view }
@@ -56,10 +79,10 @@ impl Player {
 
   pub fn command(&self, command: Command) { let _ = self.input.send(Input::Command(command)); }
 
-  pub fn view(&self) -> PlayerView { self.view.borrow().clone() }
+  pub fn view(&self) -> PlayerView { self.view.borrow().current() }
 
   /// Each receiver sees the latest view whenever it next looks.
-  pub fn subscribe(&self) -> watch::Receiver<PlayerView> { self.view.clone() }
+  pub fn subscribe(&self) -> watch::Receiver<Published> { self.view.clone() }
 }
 
 /// An audio job: the task that plays one track, and the process to signal.
@@ -73,7 +96,7 @@ struct Actor {
   daemon:    Weak<Daemon>,
   /// Where effects send their events back to.
   events:    mpsc::UnboundedSender<Input>,
-  published: watch::Sender<PlayerView>,
+  published: watch::Sender<Published>,
   job:       Option<Job>,
 }
 
@@ -89,7 +112,7 @@ impl Actor {
           vec![Effect::StopAudio]
         });
       if self.state.rev() != before {
-        self.published.send_replace(self.state.view(now));
+        self.published.send_replace(Published::new(self.state.view(now), now));
       }
       for effect in effects {
         self.run_effect(effect);

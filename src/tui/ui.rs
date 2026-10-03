@@ -100,7 +100,8 @@ pub fn render_status_bar(
   let total = player.duration();
   let ratio = match total {
     Some(total) if !total.is_zero() => {
-      (elapsed.as_secs_f64() / total.as_secs_f64()).clamp(0.0, 1.0)
+      // Whole seconds, so the bar moves exactly when the clock does.
+      (elapsed.as_secs() as f64 / total.as_secs_f64()).clamp(0.0, 1.0)
     }
     _ => 0.0,
   };

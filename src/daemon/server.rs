@@ -162,7 +162,7 @@ async fn subscribe(
   let mut view = daemon.player.subscribe();
   let mut ignored = String::new();
   loop {
-    let snapshot = view.borrow_and_update().clone();
+    let snapshot = view.borrow_and_update().current();
     if !write_response(&mut writer, &Response::Player(snapshot)).await {
       return;
     }

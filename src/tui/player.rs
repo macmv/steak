@@ -101,6 +101,21 @@ impl Player {
     }
   }
 
+  /// How long until the elapsed clock shows its next whole second, if it is
+  /// running. Redrawing exactly then keeps the seconds evenly spaced.
+  pub fn until_next_second(&self) -> Option<Duration> {
+    match (&self.view.transport, &self.down) {
+      (Transport::Playing, None) => {
+        // A hair late, so the clock has certainly passed the boundary.
+        Some(
+          Duration::from_millis(1000 - u64::from(self.elapsed().subsec_millis()))
+            + Duration::from_millis(2),
+        )
+      }
+      _ => None,
+    }
+  }
+
   pub fn duration(&self) -> Option<Duration> {
     ui::parse_duration(self.current()?.duration.as_deref()?)
   }
