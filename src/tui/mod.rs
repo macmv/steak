@@ -53,6 +53,11 @@ pub enum Msg {
     video_id: String,
     image:    DynamicImage,
   },
+  /// The small cover beside a queue entry.
+  Cover {
+    video_id: String,
+    image:    DynamicImage,
+  },
 }
 
 /// Something on screen that the mouse can hit.
@@ -217,6 +222,9 @@ impl App {
       Msg::CommandFailed(error) => self.player.on_command_failed(error),
       Msg::Art { video_id, image } => {
         self.player.set_art(video_id, self.picker.new_resize_protocol(image));
+      }
+      Msg::Cover { video_id, image } => {
+        self.player.set_cover(video_id, self.picker.new_resize_protocol(image));
       }
     }
   }

@@ -5,7 +5,10 @@
 //! the state comes back as [`PlayerView`] snapshots, so any number of TUIs (and
 //! the CLI) can drive the same player.
 
-use std::time::{Duration, Instant};
+use std::{
+  collections::{HashMap, HashSet},
+  time::{Duration, Instant},
+};
 
 use ratatui::{
   Frame,
@@ -25,6 +28,10 @@ use crate::client;
 
 /// Each queue entry takes two rows: title, then artists.
 const ITEM_HEIGHT: u16 = 2;
+/// The cover beside each entry: as tall as the entry, and twice as wide in
+/// cells because cells are about twice as tall as they are wide.
+const COVER_WIDTH: u16 = 4;
+const COVER_GAP: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
@@ -55,6 +62,11 @@ pub struct Player {
   art:        Option<(String, StatefulProtocol)>,
   /// The track whose art is loading or loaded, so it is requested once.
   art_wanted: Option<String>,
+
+  /// Small covers for the queue entries, by video ID.
+  covers:        HashMap<String, StatefulProtocol>,
+  /// The covers loading or loaded, so each is requested once.
+  covers_wanted: HashSet<String>,
 }
 
 impl Player {
@@ -69,6 +81,8 @@ impl Player {
       offset: 0,
       art: None,
       art_wanted: None,
+      covers: HashMap::new(),
+      covers_wanted: HashSet::new(),
     }
   }
 
@@ -152,7 +166,8 @@ impl Player {
       self.art = None;
     }
     self.art_wanted = wanted.clone();
-    let (Some(video_id), Some(url)) = (wanted, self.current().and_then(|t| art_url(&t.thumbnails)))
+    let (Some(video_id), Some(url)) =
+      (wanted, self.current().and_then(|t| art_url(&t.thumbnails, ART_SIZE)))
     else {
       return;
     };
@@ -165,6 +180,28 @@ impl Player {
         Err(error) => log::warn!("album art failed: {error}"),
       }
     });
+  }
+
+  /// Starts loading the cover of `track`, unless that was already done.
+  fn request_cover(&mut self, track: &Track) {
+    let Some(url) = art_url(&track.thumbnails, COVER_SIZE) else { return };
+    if !self.covers_wanted.insert(track.video_id.clone()) {
+      return;
+    }
+    let tx = self.tx.clone();
+    let video_id = track.video_id.clone();
+    tokio::spawn(async move {
+      match fetch_art(url).await {
+        Ok(image) => {
+          let _ = tx.send(Msg::Cover { video_id, image });
+        }
+        Err(error) => log::warn!("cover failed: {error}"),
+      }
+    });
+  }
+
+  pub fn set_cover(&mut self, video_id: String, protocol: StatefulProtocol) {
+    self.covers.insert(video_id, protocol);
   }
 
   pub fn set_art(&mut self, video_id: String, protocol: StatefulProtocol) {
@@ -247,26 +284,37 @@ impl Player {
         width:  inner.width,
         height: ITEM_HEIGHT.min(inner.height),
       };
-      ui::render_track(
-        frame,
-        rect,
-        &self.view.queue[idx],
-        idx == self.cursor,
-        idx == self.view.index,
-      );
+      let track = self.view.queue[idx].clone();
+      self.request_cover(&track);
+      let cover = Rect { width: COVER_WIDTH.min(rect.width), ..rect };
+      if let Some(protocol) = self.covers.get_mut(&track.video_id) {
+        frame.render_stateful_widget(StatefulImage::default(), cover, protocol);
+      }
+      let text_x = COVER_WIDTH + COVER_GAP;
+      let text = Rect {
+        x: rect.x + text_x.min(rect.width),
+        width: rect.width.saturating_sub(text_x),
+        ..rect
+      };
+      ui::render_track(frame, text, &track, idx == self.cursor, idx == self.view.index);
       hits.push(Hit { rect, target: Target::Queue(Some(idx)) });
     }
   }
 }
 
+const ART_SIZE: u32 = 544;
+const COVER_SIZE: u32 = 120;
+
 /// The largest thumbnail, asked for at a size worth putting on screen.
 ///
 /// Track rows only link a tiny thumbnail, but Google's image host will resize
 /// to whatever the `=w..-h..` suffix says.
-fn art_url(thumbnails: &[Thumbnail]) -> Option<String> {
+fn art_url(thumbnails: &[Thumbnail], size: u32) -> Option<String> {
   let best = thumbnails.iter().max_by_key(|thumbnail| thumbnail.width.unwrap_or(0))?;
   match best.url.rsplit_once('=') {
-    Some((base, size)) if size.starts_with('w') => Some(format!("{base}=w544-h544-l90-rj")),
+    Some((base, suffix)) if suffix.starts_with('w') => {
+      Some(format!("{base}=w{size}-h{size}-l90-rj"))
+    }
     _ => Some(best.url.clone()),
   }
 }
