@@ -30,11 +30,13 @@ pub struct AudioClient {
 }
 
 impl AudioClient {
-  /// Creates a client using `user_agent` for audio requests.
-  pub fn new(user_agent: header::HeaderValue) -> Self { Self { client: Client::new(), user_agent } }
+  /// Creates a client that sends audio requests through `client`.
+  pub fn new(client: Client) -> Self {
+    Self::with_user_agent(client, header::HeaderValue::from_static("st-api/0.1"))
+  }
 
   /// Creates a client with the supplied reqwest client and user agent.
-  pub fn with_client(client: Client, user_agent: header::HeaderValue) -> Self {
+  pub fn with_user_agent(client: Client, user_agent: header::HeaderValue) -> Self {
     Self { client, user_agent }
   }
 
@@ -145,10 +147,6 @@ impl AudioClient {
       Err(error) => futures_util::stream::once(std::future::ready(Err(error))).right_stream(),
     })))
   }
-}
-
-impl Default for AudioClient {
-  fn default() -> Self { Self::new(header::HeaderValue::from_static("st-api/0.1")) }
 }
 
 /// Returns whether `status` denotes a successful full or byte-range audio

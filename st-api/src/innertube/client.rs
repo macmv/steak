@@ -114,9 +114,7 @@ pub struct MusicClient {
 }
 
 impl MusicClient {
-  pub fn new(config: MusicClientConfig) -> Self { Self::with_http_client(Client::new(), config) }
-
-  pub fn with_http_client(http: Client, config: MusicClientConfig) -> Self { Self { http, config } }
+  pub fn new(http: Client, config: MusicClientConfig) -> Self { Self { http, config } }
 
   /// Calls an endpoint, adding the required `context` member to `payload`.
   pub async fn call(
@@ -301,10 +299,6 @@ fn click_tracking_context(watch: &WatchEndpoint) -> Map<String, Value> {
       Map::from_iter([(String::from("clickTracking"), json!({ "clickTrackingParams": params }))])
     })
     .unwrap_or_default()
-}
-
-impl Default for MusicClient {
-  fn default() -> Self { Self::new(MusicClientConfig::default()) }
 }
 
 #[cfg(test)]

@@ -93,9 +93,17 @@ pub struct WebBootstrapper {
 }
 
 impl WebBootstrapper {
-  pub fn new(user_agent: header::HeaderValue) -> Self { Self { http: Client::new(), user_agent } }
+  /// Creates a bootstrapper that presents a desktop browser user agent.
+  pub fn new(http: Client) -> Self {
+    Self::with_user_agent(
+      http,
+      header::HeaderValue::from_static(
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      ),
+    )
+  }
 
-  pub fn with_http_client(http: Client, user_agent: header::HeaderValue) -> Self {
+  pub fn with_user_agent(http: Client, user_agent: header::HeaderValue) -> Self {
     Self { http, user_agent }
   }
 
@@ -153,14 +161,6 @@ impl WebBootstrapper {
       request_context,
       cookies: None,
     })
-  }
-}
-
-impl Default for WebBootstrapper {
-  fn default() -> Self {
-    Self::new(header::HeaderValue::from_static(
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    ))
   }
 }
 

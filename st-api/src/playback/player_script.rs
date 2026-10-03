@@ -121,14 +121,14 @@ fn replace_query_value(url: &mut Url, name: &str, value: &str) {
 
 /// Fetches a player script and resolves `signatureCipher` URLs with the EJS
 /// solver.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct EjsCipherResolver {
   http:    Client,
   players: Arc<Mutex<HashMap<String, Arc<str>>>>,
 }
 
 impl EjsCipherResolver {
-  pub fn new() -> Self { Self::default() }
+  pub fn new(http: Client) -> Self { Self { http, players: Default::default() } }
 
   pub async fn resolve(
     &self,
@@ -291,8 +291,9 @@ mod tests {
   #[test]
   fn direct_url_without_n_is_returned_unchanged() {
     let url = Url::parse("https://example.test/a?x=1").unwrap();
-    let resolved =
-      EjsCipherResolver::new().resolve_with_script("", &StreamUrl::Direct(url.clone())).unwrap();
+    let resolved = EjsCipherResolver::new(Client::new())
+      .resolve_with_script("", &StreamUrl::Direct(url.clone()))
+      .unwrap();
     assert_eq!(resolved, url);
   }
 
@@ -300,8 +301,9 @@ mod tests {
   fn direct_url_with_n_gets_n_solved() {
     let script = include_str!("../../tests/fixtures/players/8ab5c328.js");
     let url = Url::parse("https://example.test/a?x=1&n=abcdefghijk").unwrap();
-    let resolved =
-      EjsCipherResolver::new().resolve_with_script(script, &StreamUrl::Direct(url)).unwrap();
+    let resolved = EjsCipherResolver::new(Client::new())
+      .resolve_with_script(script, &StreamUrl::Direct(url))
+      .unwrap();
     assert_eq!(resolved.query(), Some("x=1&n=VXuZqhSdiY"));
   }
 
@@ -351,7 +353,7 @@ mod tests {
     let stream = StreamUrl::SignatureCipher(format!(
       "url=https%3A%2F%2Fexample.test%2Faudio%3Fn%3Dabcdefghijk&s={sig}&sp=sig"
     ));
-    let url = EjsCipherResolver::new().resolve_with_script(script, &stream).unwrap();
+    let url = EjsCipherResolver::new(Client::new()).resolve_with_script(script, &stream).unwrap();
     assert_eq!(query_value(&url, "n").as_deref(), Some("VXuZqhSdiY"));
     assert_eq!(
       query_value(&url, "sig").as_deref(),

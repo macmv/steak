@@ -159,10 +159,11 @@ fn setup_logging() -> Result<(), log::SetLoggerError> {
 /// for every video, so they come from the cache when present. Anything missing
 /// is rebuilt the slow way and saved.
 async fn resolve_stream(
+  http: &st_api::Client,
   cache: &Cache,
   video_id: &str,
 ) -> Result<Url, Box<dyn Error + Send + Sync>> {
-  let bootstrapper = WebBootstrapper::default();
+  let bootstrapper = WebBootstrapper::new(http.clone());
   let bootstrap = match cache.bootstrap() {
     Some(bootstrap) => {
       debug!("using cached YouTube Music client configuration");
@@ -196,7 +197,7 @@ async fn resolve_stream(
   // The player request must name the player script's signature timestamp. With
   // a cached solver, load it in the background while the request is in flight;
   // otherwise download the full script and solve from it after the request.
-  let resolver = EjsCipherResolver::new();
+  let resolver = EjsCipherResolver::new(http.clone());
   let (signature_timestamp, solve) = match (cache.signature_timestamp(), cache.solver()) {
     (Some(timestamp), Some(solver)) => {
       debug!("using cached solver for signature timestamp {timestamp}");
@@ -216,8 +217,9 @@ async fn resolve_stream(
     }
   };
 
-  let player_response =
-    MusicClient::new(config).player_with_signature_timestamp(video_id, signature_timestamp).await?;
+  let player_response = MusicClient::new(http.clone(), config)
+    .player_with_signature_timestamp(video_id, signature_timestamp)
+    .await?;
   debug!("received player response for {video_id}");
   if let (Solve::Cached(_), Some(url)) =
     (&solve, StandardPlayerParser::player_script_url(&player_response))
@@ -255,6 +257,7 @@ enum Solve {
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   setup_logging()?;
   let cli = Cli::parse();
+  let http = st_api::Client::new();
   match cli.command {
     Some(CliCommand::Auth(auth)) => {
       return match auth.command {
@@ -263,7 +266,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
       };
     }
-    Some(CliCommand::Home { more }) => return home_command(more).await,
+    Some(CliCommand::Home { more }) => return home_command(&http, more).await,
     None => {}
   }
   let video_id =
@@ -272,14 +275,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
   let cache = Cache::open();
   let populated = cache.is_populated();
-  let stream_url = match resolve_stream(&cache, &video_id).await {
+  let stream_url = match resolve_stream(&http, &cache, &video_id).await {
     Ok(url) => url,
     // Something cached no longer works (YouTube rotated the player, say). Drop
     // all of it and rebuild from scratch, once.
     Err(error) if populated => {
       warn!("cached state failed ({error}); clearing it and starting over");
       cache.clear();
-      resolve_stream(&cache, &video_id).await?
+      resolve_stream(&http, &cache, &video_id).await?
     }
     Err(error) => return Err(error),
   };
@@ -287,7 +290,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   // googlevideo refuses a stream past its first chunk unless it carries a
   // valid PoToken. This is outside the cache fallback above on purpose: a
   // PoToken failure says nothing about the cache.
-  let audio_client = AudioClient::default();
+  let audio_client = AudioClient::new(http.clone());
   let botguard = match std::env::var_os("STEAK_BOTGUARD") {
     Some(binary) => BotguardCliProvider::new(binary),
     None => BotguardCliProvider::default(),
@@ -310,11 +313,14 @@ fn auth_command(
 
 /// Builds an authenticated Music client from the cached (or fresh) web app
 /// configuration and the stored session.
-async fn music_client(cache: &Cache) -> Result<MusicClient, Box<dyn Error + Send + Sync>> {
+async fn music_client(
+  http: &st_api::Client,
+  cache: &Cache,
+) -> Result<MusicClient, Box<dyn Error + Send + Sync>> {
   let bootstrap = match cache.bootstrap() {
     Some(bootstrap) => bootstrap,
     None => {
-      let bootstrap = WebBootstrapper::default().bootstrap().await?;
+      let bootstrap = WebBootstrapper::new(http.clone()).bootstrap().await?;
       cache.store_bootstrap(&bootstrap);
       bootstrap
     }
@@ -324,12 +330,15 @@ async fn music_client(cache: &Cache) -> Result<MusicClient, Box<dyn Error + Send
   let session =
     st_api::account::session::StoredSession::load(&st_api::account::session::session_path())?;
   config.headers.extend(session.auth_session().request_headers());
-  Ok(MusicClient::new(config))
+  Ok(MusicClient::new(http.clone(), config))
 }
 
-async fn home_command(more: u32) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn home_command(
+  http: &st_api::Client,
+  more: u32,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
   let cache = Cache::open();
-  let client = music_client(&cache).await?;
+  let client = music_client(&http, &cache).await?;
   let parser = HomeParser;
 
   let mut response = client.browse("FEmusic_home", None).await?;

@@ -8,7 +8,8 @@ use st_api::innertube::bootstrap::{Bootstrapper, WebBootstrapper};
 #[tokio::test]
 #[ignore = "fetches the live YouTube Music bootstrap page"]
 async fn live_music_homepage_contains_innertube_bootstrap_data() {
-  let bootstrap = WebBootstrapper::default().bootstrap().await.unwrap();
+  let http = st_api::Client::new();
+  let bootstrap = WebBootstrapper::new(http.clone()).bootstrap().await.unwrap();
 
   assert!(!bootstrap.api_key.is_empty(), "INNERTUBE_API_KEY must be present");
   assert!(!bootstrap.client_version.is_empty(), "client version must be present");

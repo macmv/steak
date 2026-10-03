@@ -18,15 +18,16 @@ use st_api::{
 #[tokio::test]
 #[ignore = "calls live YouTube Music search and player endpoints"]
 async fn search_result_has_an_audio_format_in_its_player_response() {
+  let http = st_api::Client::new();
   let session_path = session_path();
   let session = StoredSession::load(&session_path)
     .expect("run `steak auth import-firefox` before this live test");
-  let bootstrapper = WebBootstrapper::default();
+  let bootstrapper = WebBootstrapper::new(http.clone());
   let bootstrap = bootstrapper.bootstrap().await.unwrap();
   let mut config = MusicClientConfig::default();
   bootstrap.apply_to(&mut config);
   config.headers.extend(session.auth_session().request_headers());
-  let music = MusicClient::new(config);
+  let music = MusicClient::new(http.clone(), config);
 
   let search = music.search("Daft Punk Around the World", None).await.unwrap();
   let track = SearchParser
@@ -58,8 +59,10 @@ async fn search_result_has_an_audio_format_in_its_player_response() {
     let script_url = StandardPlayerParser::player_script_url(&player)
       .or(bootstrapper.player_script_url(&track.video_id).await.unwrap())
       .expect("watch page must advertise its JavaScript URL for ciphered formats");
-    let resolved =
-      EjsCipherResolver::new().resolve(&script_url, &selected.stream_url).await.unwrap();
+    let resolved = EjsCipherResolver::new(http.clone())
+      .resolve(&script_url, &selected.stream_url)
+      .await
+      .unwrap();
     assert!(resolved.query_pairs().any(|(key, _)| key == "signature" || key == "sig"));
     let n = resolved.query_pairs().find(|(key, _)| key == "n").map(|(_, value)| value.into_owned());
     assert!(n.is_some(), "resolved media URL must retain a transformed n parameter");
