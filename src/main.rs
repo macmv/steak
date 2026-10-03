@@ -64,6 +64,14 @@ enum CliCommand {
     /// YouTube video ID to play.
     video_id: String,
   },
+  /// Download a video's audio track as an mp4 file, using `ffmpeg`.
+  Download {
+    /// YouTube video ID to download.
+    video_id: String,
+    /// Output file (defaults to `<video_id>.mp4`).
+    #[arg(short, long)]
+    output:   Option<std::path::PathBuf>,
+  },
 }
 
 #[derive(Debug, Args)]
@@ -98,6 +106,63 @@ where
   S: Stream<Item = Result<Bytes, E>> + Send + 'static,
   E: Error + Send + Sync + 'static,
 {
+  pipe_to_ffmpeg(
+    "ffplay",
+    &[
+      "-nodisp".as_ref(),
+      "-autoexit".as_ref(),
+      "-loglevel".as_ref(),
+      "error".as_ref(),
+      "-i".as_ref(),
+      "pipe:0".as_ref(),
+    ],
+    audio,
+  )
+  .await
+}
+
+/// Transcodes a compressed audio byte stream into an mp4 file with `ffmpeg`.
+///
+/// The audio is re-encoded to AAC, because the stream may be Opus/WebM, which
+/// isn't reliably playable inside an mp4.
+pub async fn download<S, E>(
+  audio: S,
+  output: &std::path::Path,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+  S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+  E: Error + Send + Sync + 'static,
+{
+  let args: [&std::ffi::OsStr; 12] = [
+    "-y".as_ref(),
+    "-loglevel".as_ref(),
+    "error".as_ref(),
+    "-i".as_ref(),
+    "pipe:0".as_ref(),
+    "-vn".as_ref(),
+    "-c:a".as_ref(),
+    "aac".as_ref(),
+    "-b:a".as_ref(),
+    "256k".as_ref(),
+    "-f".as_ref(),
+    "mp4".as_ref(),
+  ];
+  let mut all = args.to_vec();
+  all.push(output.as_os_str());
+  pipe_to_ffmpeg("ffmpeg", &all, audio).await
+}
+
+/// Feeds `audio` to the stdin of `program` (an FFmpeg tool) and waits for it
+/// to exit.
+async fn pipe_to_ffmpeg<S, E>(
+  program: &str,
+  args: &[&std::ffi::OsStr],
+  audio: S,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+  S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+  E: Error + Send + Sync + 'static,
+{
   // Keep network reads independent from writes to the player. If ffplay falls
   // behind, `send` waits once this buffer is full and applies backpressure.
   let (sender, mut chunks) = mpsc::channel::<Result<Bytes, E>>(64);
@@ -117,19 +182,16 @@ where
     debug!("audio fetch task finished");
   });
 
-  debug!("starting ffplay process");
-  let mut player = Command::new("ffplay")
-    .args(["-nodisp", "-autoexit", "-loglevel", "error", "-i", "pipe:0"])
-    .stdin(Stdio::piped())
-    .spawn()?;
-  let mut stdin = player.stdin.take().expect("ffplay stdin was piped");
+  debug!("starting {program} process");
+  let mut player = Command::new(program).args(args).stdin(Stdio::piped()).spawn()?;
+  let mut stdin = player.stdin.take().expect("stdin was piped");
   let mut played_bytes = 0_u64;
 
   while let Some(chunk) = chunks.recv().await {
     match chunk {
       Ok(chunk) => {
         played_bytes += chunk.len() as u64;
-        debug!("writing {} bytes to ffplay ({} total)", chunk.len(), played_bytes);
+        debug!("writing {} bytes to {program} ({} total)", chunk.len(), played_bytes);
         stdin.write_all(&chunk).await?;
       }
       Err(error) => {
@@ -140,13 +202,13 @@ where
       }
     }
   }
-  drop(stdin); // EOF tells ffplay there are no more encoded bytes.
+  drop(stdin); // EOF tells the process there are no more encoded bytes.
 
   fetch_task.await?;
   let status = player.wait().await?;
-  debug!("ffplay exited with {status} after receiving {played_bytes} bytes");
+  debug!("{program} exited with {status} after receiving {played_bytes} bytes");
   if !status.success() {
-    return Err("ffplay exited unsuccessfully".into());
+    return Err(format!("{program} exited unsuccessfully").into());
   }
   Ok(())
 }
@@ -271,6 +333,33 @@ enum Solve {
   Script(Arc<str>),
 }
 
+/// Resolves `video_id` to an audio URL that googlevideo will serve in full.
+async fn authorized_stream(
+  http: &st_api::Client,
+  video_id: &str,
+) -> Result<(AudioClient, Url), Box<dyn Error + Send + Sync>> {
+  let cache = Cache::open();
+  let populated = cache.is_populated();
+  let stream_url = match resolve_stream(http, &cache, video_id).await {
+    Ok(url) => url,
+    // Something cached no longer works (YouTube rotated the player, say). Drop
+    // all of it and rebuild from scratch, once.
+    Err(error) if populated => {
+      warn!("cached state failed ({error}); clearing it and starting over");
+      cache.clear();
+      resolve_stream(http, &cache, video_id).await?
+    }
+    Err(error) => return Err(error),
+  };
+
+  // googlevideo refuses a stream past its first chunk unless it carries a
+  // valid PoToken. This is outside the cache fallback above on purpose: a
+  // PoToken failure says nothing about the cache.
+  let audio_client = AudioClient::new(http.clone());
+  let stream_url = authorize_stream(&audio_client, stream_url, video_id).await?;
+  Ok((audio_client, stream_url))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
   setup_logging()?;
@@ -294,28 +383,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     Some(CliCommand::Play { video_id }) => {
       info!("starting playback request for YouTube video {video_id}");
-
-      let cache = Cache::open();
-      let populated = cache.is_populated();
-      let stream_url = match resolve_stream(&http, &cache, &video_id).await {
-        Ok(url) => url,
-        // Something cached no longer works (YouTube rotated the player, say). Drop
-        // all of it and rebuild from scratch, once.
-        Err(error) if populated => {
-          warn!("cached state failed ({error}); clearing it and starting over");
-          cache.clear();
-          resolve_stream(&http, &cache, &video_id).await?
-        }
-        Err(error) => return Err(error),
-      };
-
-      // googlevideo refuses a stream past its first chunk unless it carries a
-      // valid PoToken. This is outside the cache fallback above on purpose: a
-      // PoToken failure says nothing about the cache.
-      let audio_client = AudioClient::new(http.clone());
-      let stream_url = authorize_stream(&audio_client, stream_url, &video_id).await?;
+      let (audio_client, stream_url) = authorized_stream(&http, &video_id).await?;
       let audio = audio_client.stream_chunked(AudioRequest::new(stream_url)).await?;
       play(audio).await?;
+    }
+    Some(CliCommand::Download { video_id, output }) => {
+      info!("starting download request for YouTube video {video_id}");
+      let output = output.unwrap_or_else(|| format!("{video_id}.mp4").into());
+      let (audio_client, stream_url) = authorized_stream(&http, &video_id).await?;
+      let audio = audio_client.stream_chunked(AudioRequest::new(stream_url)).await?;
+      download(audio, &output).await?;
+      info!("saved {}", output.display());
     }
     None => {}
   }
