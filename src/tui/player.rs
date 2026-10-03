@@ -316,7 +316,7 @@ fn centered_square(area: Rect) -> Rect {
   }
 }
 
-const ART_SIZE: u32 = 544;
+const ART_SIZE: u32 = 1200;
 const COVER_SIZE: u32 = 120;
 
 /// The largest thumbnail, asked for at a size worth putting on screen.
