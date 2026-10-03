@@ -57,7 +57,7 @@ async fn search_result_has_an_audio_format_in_its_player_response() {
   );
   if let StreamUrl::SignatureCipher(_) = &selected.stream_url {
     let script_url = StandardPlayerParser::player_script_url(&player)
-      .or(bootstrapper.player_script_url(&track.video_id).await.unwrap())
+      .or(bootstrapper.player_script_url().await.unwrap())
       .expect("watch page must advertise its JavaScript URL for ciphered formats");
     let resolved = EjsCipherResolver::new(http.clone())
       .resolve(&script_url, &selected.stream_url)

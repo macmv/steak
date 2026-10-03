@@ -3023,7 +3023,15 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "st-proto",
  "tokio",
+]
+
+[[package]]
+name = "st-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -3052,8 +3060,10 @@ dependencies = [
  "log",
  "ratatui",
  "ratatui-image",
- "reqwest",
+ "serde",
+ "serde_json",
  "st-api",
+ "st-proto",
  "tokio",
 ]
 

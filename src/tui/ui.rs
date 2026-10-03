@@ -9,7 +9,7 @@ use ratatui::{
   text::{Line, Span},
   widgets::{Block, LineGauge, Paragraph},
 };
-use st_api::catalog::Track;
+use st_proto::catalog::Track;
 
 use super::{
   Hit, Target,
@@ -85,6 +85,9 @@ pub fn render_status_bar(
     Status::Paused => ("Paused".to_owned(), Style::default().fg(Color::Yellow)),
     Status::Finished => ("Finished".to_owned(), Style::default().fg(Color::Gray)),
     Status::Failed(error) => (format!("Error: {error}"), Style::default().fg(Color::Red)),
+    Status::Disconnected(reason) => {
+      (format!("Daemon unreachable ({reason}); retrying"), Style::default().fg(Color::Red))
+    }
   };
   let mut spans = vec![Span::styled(format!("{state}  "), style)];
   if let Some(track) = player.current() {

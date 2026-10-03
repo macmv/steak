@@ -1,5 +1,10 @@
 //! The terminal UI: a homepage of tracks, and the radio player.
 //!
+//! This is a client of the daemon and nothing else: the homepage, the album
+//! art and the whole player state come over its socket (see `client.rs`), and
+//! every key that does something is a command sent back. Any number of these
+//! can be attached at once.
+//!
 //! The player's status is always visible along the bottom; the player screen
 //! expands it to show the album art and the radio queue.
 
@@ -20,27 +25,34 @@ use ratatui::{
   layout::{Constraint, Layout, Position, Rect},
 };
 use ratatui_image::picker::Picker;
-use st_api::{
-  cache::Cache,
-  catalog::{HomeParser, Shelf, Track},
-  innertube::client::MusicClient,
+use st_proto::{
+  catalog::{Shelf, Track},
+  ipc::{PlayerView, Request, Response},
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use self::{home::Home, player::Player};
+use crate::client;
 
 /// How many pages of homepage shelves to load.
-const HOME_PAGES: usize = 3;
+const HOME_PAGES: u32 = 3;
+/// How long to wait before trying to reach the daemon again.
+const RECONNECT_AFTER: Duration = Duration::from_secs(1);
 const STATUS_BAR_HEIGHT: u16 = 4;
 
 /// Results of background work, delivered to the event loop.
 pub enum Msg {
-  Client(MusicClient),
   Shelves(Vec<Shelf>),
-  HomeDone(Option<String>),
-  Radio { radio_id: u64, more: bool, result: Result<(Vec<Track>, Option<String>), String> },
-  Art { video_id: String, image: DynamicImage },
-  Finished { generation: u64, result: Result<(), String> },
+  HomeFailed(String),
+  /// The daemon's player changed (or this is its state on connecting).
+  Player(PlayerView),
+  /// The connection to the daemon dropped; it is being re-established.
+  Disconnected(String),
+  CommandFailed(String),
+  Art {
+    video_id: String,
+    image:    DynamicImage,
+  },
 }
 
 /// Something on screen that the mouse can hit.
@@ -68,16 +80,17 @@ struct App {
   screen: Screen,
   home:   Home,
   player: Player,
-  client: Option<MusicClient>,
   picker: Picker,
+  tx:     UnboundedSender<Msg>,
   /// What the last frame drew where; the mouse is resolved against it.
   hits:   Vec<Hit>,
   quit:   bool,
 }
 
-pub async fn run(http: st_api::Client) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
   let (tx, rx) = mpsc::unbounded_channel();
-  load_home(http.clone(), tx.clone());
+  load_home(tx.clone());
+  watch_player(tx.clone());
 
   let mut terminal = ratatui::init();
   crossterm::execute!(stdout(), EnableMouseCapture)?;
@@ -86,9 +99,9 @@ pub async fn run(http: st_api::Client) -> Result<(), Box<dyn Error + Send + Sync
   let app = App {
     screen: Screen::Home,
     home: Home::new(),
-    player: Player::new(http, tx),
-    client: None,
+    player: Player::new(tx.clone()),
     picker,
+    tx,
     hits: Vec::new(),
     quit: false,
   };
@@ -98,24 +111,40 @@ pub async fn run(http: st_api::Client) -> Result<(), Box<dyn Error + Send + Sync
   result
 }
 
-fn load_home(http: st_api::Client, tx: UnboundedSender<Msg>) {
+fn load_home(tx: UnboundedSender<Msg>) {
   tokio::spawn(async move {
-    let result: Result<(), Box<dyn Error + Send + Sync>> = async {
-      let client = crate::music_client(&http, &Cache::open()).await?;
-      let _ = tx.send(Msg::Client(client.clone()));
-      let parser = HomeParser;
-      let mut response = client.browse("FEmusic_home", None).await?;
-      for page in 0..HOME_PAGES {
-        let _ = tx.send(Msg::Shelves(parser.shelves(&response)));
-        let Some(token) = parser.continuation(&response).filter(|_| page + 1 < HOME_PAGES) else {
-          break;
-        };
-        response = client.browse_continuation(token).await?;
+    let msg = match client::call(Request::Home { more: HOME_PAGES - 1 }).await {
+      Ok(Response::Home { shelves, .. }) => Msg::Shelves(shelves),
+      Ok(other) => Msg::HomeFailed(format!("the daemon sent an unexpected response: {other:?}")),
+      Err(error) => Msg::HomeFailed(error.to_string()),
+    };
+    let _ = tx.send(msg);
+  });
+}
+
+/// Keeps a subscription to the daemon's player open, forever: when the
+/// connection drops (the daemon restarted, say) it says so and tries again.
+fn watch_player(tx: UnboundedSender<Msg>) {
+  tokio::spawn(async move {
+    loop {
+      let error = match client::subscribe().await {
+        Ok(mut subscription) => loop {
+          match subscription.next().await {
+            Ok(view) => {
+              if tx.send(Msg::Player(view)).is_err() {
+                return; // The UI is gone.
+              }
+            }
+            Err(error) => break error,
+          }
+        },
+        Err(error) => error,
+      };
+      if tx.send(Msg::Disconnected(error.to_string())).is_err() {
+        return;
       }
-      Ok(())
+      tokio::time::sleep(RECONNECT_AFTER).await;
     }
-    .await;
-    let _ = tx.send(Msg::HomeDone(result.err().map(|error| error.to_string())));
   });
 }
 
@@ -136,7 +165,8 @@ impl App {
           _ => {}
         },
         Some(msg) = rx.recv() => self.on_msg(msg),
-        _ = tick.tick() => self.player.tick(),
+        // Redraws, so the clock moves.
+        _ = tick.tick() => {}
       }
     }
     Ok(())
@@ -162,24 +192,39 @@ impl App {
 
   fn on_msg(&mut self, msg: Msg) {
     match msg {
-      Msg::Client(client) => self.client = Some(client),
-      Msg::Shelves(shelves) => self.home.add_shelves(shelves),
-      Msg::HomeDone(error) => {
+      Msg::Shelves(shelves) => {
+        self.home.add_shelves(shelves);
         self.home.loading = false;
-        self.home.error = error;
+        self.home.error = None;
       }
-      Msg::Radio { radio_id, more, result } => self.player.on_radio(radio_id, more, result),
+      Msg::HomeFailed(error) => {
+        self.home.loading = false;
+        self.home.error = Some(error);
+      }
+      Msg::Player(view) => {
+        // The daemon is reachable, so a homepage that failed to load may work
+        // now.
+        self.reload_home_if_failed();
+        self.player.on_view(view);
+      }
+      Msg::Disconnected(reason) => self.player.on_disconnected(reason),
+      Msg::CommandFailed(error) => self.player.on_command_failed(error),
       Msg::Art { video_id, image } => {
         self.player.set_art(video_id, self.picker.new_resize_protocol(image));
       }
-      Msg::Finished { generation, result } => self.player.on_finished(generation, result),
+    }
+  }
+
+  fn reload_home_if_failed(&mut self) {
+    if self.home.error.take().is_some() {
+      self.home.loading = true;
+      load_home(self.tx.clone());
     }
   }
 
   /// Starts the radio from `track` and opens the player.
   fn start_radio(&mut self, track: Track) {
-    let Some(client) = self.client.clone() else { return };
-    self.player.start_radio(client, track);
+    self.player.start_radio(track);
     self.screen = Screen::Player;
   }
 

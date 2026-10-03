@@ -1,0 +1,9 @@
+[package]
+name = "st-proto"
+version = "0.1.0"
+edition = "2024"
+
+# Only plain data and serde: the TUI and the CLI depend on this crate and on
+# nothing that talks to YouTube.
+[dependencies]
+serde = { version = "1", features = ["derive"] }

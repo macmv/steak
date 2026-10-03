@@ -1,13 +1,11 @@
-//! The radio: a queue of tracks, the audio task playing the current one, and
-//! the expanded player screen.
+//! The player as the TUI sees it: the daemon's state, and what is local to
+//! this screen (the cursor, the scroll position, the decoded album art).
+//!
+//! Nothing here plays anything. Keys become [`Command`]s for the daemon, and
+//! the state comes back as [`PlayerView`] snapshots, so any number of TUIs (and
+//! the CLI) can drive the same player.
 
-use std::{
-  sync::{
-    Arc,
-    atomic::{AtomicU32, Ordering},
-  },
-  time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use ratatui::{
   Frame,
@@ -16,18 +14,15 @@ use ratatui::{
   widgets::{Block, Paragraph},
 };
 use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
-use st_api::{
-  catalog::{QueueParser, Thumbnail, Track},
-  innertube::client::MusicClient,
+use st_proto::{
+  catalog::{Thumbnail, Track},
+  ipc::{Command, PlayerView, Request, Source, Transport},
 };
-use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
+use tokio::sync::mpsc::UnboundedSender;
 
 use super::{Hit, Msg, Target, ui};
+use crate::client;
 
-/// Start loading more of the radio when this few tracks remain.
-const LOAD_MORE_WITHIN: usize = 3;
-/// Past this much playback, "previous" restarts the track instead.
-const RESTART_AFTER: Duration = Duration::from_secs(3);
 /// Each queue entry takes two rows: title, then artists.
 const ITEM_HEIGHT: u16 = 2;
 
@@ -39,221 +34,122 @@ pub enum Status {
   Paused,
   Finished,
   Failed(String),
+  /// The daemon is not reachable. The view on screen is the last one seen.
+  Disconnected(String),
 }
 
 pub struct Player {
-  http:   st_api::Client,
-  tx:     UnboundedSender<Msg>,
-  client: Option<MusicClient>,
+  tx:    UnboundedSender<Msg>,
+  view:  PlayerView,
+  /// When `view` arrived, which is what its `position_ms` is relative to.
+  seen:  Instant,
+  /// Why the daemon cannot be reached, or why the last command failed.
+  down:  Option<String>,
+  error: Option<String>,
 
-  queue:        Vec<Track>,
-  index:        usize,
-  /// The queue entry the keyboard has selected; follows `index` on track
-  /// change.
-  cursor:       usize,
-  offset:       usize,
-  continuation: Option<String>,
-  loading_more: bool,
-  /// Distinguishes radios, so a slow response for an abandoned one is ignored.
-  radio_id:     u64,
+  /// The queue entry the keyboard has selected; follows the current track
+  /// when it changes.
+  cursor: usize,
+  offset: usize,
 
-  /// Distinguishes tracks, for the same reason.
-  generation: u64,
-  task:       Option<JoinHandle<()>>,
-  /// ffplay's process ID once it is running, else 0.
-  pid:        Arc<AtomicU32>,
-  begun:      bool,
-  paused:     bool,
-  started:    Option<Instant>,
-  accum:      Duration,
-  error:      Option<String>,
-  finished:   bool,
-
-  art: Option<(String, StatefulProtocol)>,
+  art:        Option<(String, StatefulProtocol)>,
+  /// The track whose art is loading or loaded, so it is requested once.
+  art_wanted: Option<String>,
 }
 
 impl Player {
-  pub fn new(http: st_api::Client, tx: UnboundedSender<Msg>) -> Self {
+  pub fn new(tx: UnboundedSender<Msg>) -> Self {
     Self {
-      http,
       tx,
-      client: None,
-      queue: Vec::new(),
-      index: 0,
+      view: PlayerView::default(),
+      seen: Instant::now(),
+      down: None,
+      error: None,
       cursor: 0,
       offset: 0,
-      continuation: None,
-      loading_more: false,
-      radio_id: 0,
-      generation: 0,
-      task: None,
-      pid: Arc::new(AtomicU32::new(0)),
-      begun: false,
-      paused: false,
-      started: None,
-      accum: Duration::ZERO,
-      error: None,
-      finished: false,
       art: None,
+      art_wanted: None,
     }
   }
 
-  pub fn current(&self) -> Option<&Track> { self.queue.get(self.index) }
+  pub fn current(&self) -> Option<&Track> { self.view.current() }
 
   pub fn status(&self) -> Status {
+    if let Some(reason) = &self.down {
+      return Status::Disconnected(reason.clone());
+    }
     if let Some(error) = &self.error {
-      Status::Failed(error.clone())
-    } else if self.queue.is_empty() {
-      Status::Idle
-    } else if self.finished {
-      Status::Finished
-    } else if self.paused {
-      Status::Paused
-    } else if !self.begun {
-      Status::Loading
-    } else {
-      Status::Playing
+      return Status::Failed(error.clone());
+    }
+    match &self.view.transport {
+      Transport::Idle => Status::Idle,
+      Transport::Loading => Status::Loading,
+      Transport::Playing => Status::Playing,
+      Transport::Paused => Status::Paused,
+      Transport::Ended => Status::Finished,
+      Transport::Failed(error) => Status::Failed(error.clone()),
     }
   }
 
+  /// How far into the track playback is: the daemon's position when the view
+  /// arrived, plus the time since if it is playing.
   pub fn elapsed(&self) -> Duration {
-    self.accum + self.started.map_or(Duration::ZERO, |started| started.elapsed())
+    let base = Duration::from_millis(self.view.position_ms);
+    match (&self.view.transport, &self.down) {
+      (Transport::Playing, None) => base + self.seen.elapsed(),
+      _ => base,
+    }
   }
 
   pub fn duration(&self) -> Option<Duration> {
     ui::parse_duration(self.current()?.duration.as_deref()?)
   }
 
-  /// Replaces the queue with the song radio of `seed` and starts playing it.
-  ///
-  /// The seed plays right away; the rest of the radio fills in behind it.
-  pub fn start_radio(&mut self, client: MusicClient, seed: Track) {
-    self.radio_id += 1;
-    self.client = Some(client.clone());
-    self.continuation = None;
-    self.loading_more = false;
-    self.queue = vec![seed.clone()];
-    self.fetch(client, seed.video_id, None);
-    self.play_index(0);
-  }
-
-  fn fetch(&self, client: MusicClient, seed_id: String, token: Option<String>) {
-    let tx = self.tx.clone();
-    let radio_id = self.radio_id;
-    let more = token.is_some();
-    tokio::spawn(async move {
-      let result = async {
-        let response = match token {
-          Some(token) => client.next_continuation(token).await?,
-          None => client.next(&seed_id, Some(format!("RDAMVM{seed_id}"))).await?,
-        };
-        Ok::<_, reqwest::Error>((
-          QueueParser.tracks(&response),
-          QueueParser.continuation(&response),
-        ))
-      }
-      .await
-      .map_err(|error| error.to_string());
-      let _ = tx.send(Msg::Radio { radio_id, more, result });
-    });
-  }
-
-  pub fn on_radio(
-    &mut self,
-    radio_id: u64,
-    more: bool,
-    result: Result<(Vec<Track>, Option<String>), String>,
-  ) {
-    if radio_id != self.radio_id {
-      return;
-    }
-    self.loading_more = false;
-    let (tracks, continuation) = match result {
-      Ok(batch) => batch,
-      Err(error) => {
-        log::warn!("loading the radio failed: {error}");
-        return;
-      }
-    };
-    if more {
-      let before = self.queue.len();
-      let fresh: Vec<Track> = tracks
-        .into_iter()
-        .filter(|track| !self.queue.iter().any(|queued| queued.video_id == track.video_id))
-        .collect();
-      self.queue.extend(fresh);
-      // A batch with nothing new would otherwise be requested again forever.
-      self.continuation = continuation.filter(|_| self.queue.len() > before);
-    } else {
-      // The radio normally opens with the seed, which is already playing.
-      let seed = self.queue[0].clone();
-      let rest: Vec<Track> =
-        tracks.into_iter().filter(|track| track.video_id != seed.video_id).collect();
-      self.queue = std::iter::once(seed).chain(rest).collect();
-      self.continuation = continuation;
-    }
-    self.maybe_load_more();
-  }
-
-  fn maybe_load_more(&mut self) {
-    if self.loading_more || self.index + LOAD_MORE_WITHIN < self.queue.len() {
-      return;
-    }
-    let (Some(client), Some(token)) = (self.client.clone(), self.continuation.take()) else {
-      return;
-    };
-    self.loading_more = true;
-    self.fetch(client, self.queue[0].video_id.clone(), Some(token));
-  }
-
-  pub fn play_index(&mut self, index: usize) {
-    let Some(track) = self.queue.get(index) else { return };
-    let video_id = track.video_id.clone();
-    let art_url = art_url(&track.thumbnails);
-    self.index = index;
-    self.cursor = index;
-
-    // Dropping the old task also kills its ffplay.
-    if let Some(task) = self.task.take() {
-      task.abort();
-    }
-    self.generation += 1;
-    self.pid = Arc::new(AtomicU32::new(0));
-    self.begun = false;
-    self.paused = false;
-    self.started = None;
-    self.accum = Duration::ZERO;
+  /// Takes a new state from the daemon.
+  pub fn on_view(&mut self, view: PlayerView) {
+    let before = self.current().map(|track| track.video_id.clone());
+    let queue_before = self.view.queue.first().map(|track| track.video_id.clone());
+    self.view = view;
+    self.seen = Instant::now();
+    self.down = None;
     self.error = None;
-    self.finished = false;
 
-    let (http, tx, generation, pid) =
-      (self.http.clone(), self.tx.clone(), self.generation, self.pid.clone());
-    let id = video_id.clone();
-    self.task = Some(tokio::spawn(async move {
-      let result = async {
-        let audio = crate::open_audio(&http, &id).await?;
-        crate::play(audio, true, &pid).await
-      }
-      .await
-      .map_err(|error| error.to_string());
-      let _ = tx.send(Msg::Finished { generation, result });
-    }));
+    let after = self.current().map(|track| track.video_id.clone());
+    let queue_after = self.view.queue.first().map(|track| track.video_id.clone());
+    if before != after || queue_before != queue_after {
+      self.cursor = self.view.index;
+    }
+    self.cursor = self.cursor.min(self.view.queue.len().saturating_sub(1));
+    self.request_art();
+  }
 
-    if self.art.as_ref().is_some_and(|(id, _)| *id != video_id) {
+  /// The daemon went away. The last state stays on screen, marked as stale.
+  pub fn on_disconnected(&mut self, reason: String) { self.down = Some(reason); }
+
+  pub fn on_command_failed(&mut self, error: String) { self.error = Some(error); }
+
+  fn request_art(&mut self) {
+    let wanted = self.current().map(|track| track.video_id.clone());
+    if wanted == self.art_wanted {
+      return;
+    }
+    if self.art.as_ref().is_some_and(|(id, _)| Some(id) != wanted.as_ref()) {
       self.art = None;
     }
-    if let Some(url) = art_url {
-      let (http, tx) = (self.http.clone(), self.tx.clone());
-      tokio::spawn(async move {
-        match fetch_art(&http, &url).await {
-          Ok(image) => {
-            let _ = tx.send(Msg::Art { video_id, image });
-          }
-          Err(error) => log::warn!("album art failed: {error}"),
+    self.art_wanted = wanted.clone();
+    let (Some(video_id), Some(url)) = (wanted, self.current().and_then(|t| art_url(&t.thumbnails)))
+    else {
+      return;
+    };
+    let tx = self.tx.clone();
+    tokio::spawn(async move {
+      match fetch_art(url).await {
+        Ok(image) => {
+          let _ = tx.send(Msg::Art { video_id, image });
         }
-      });
-    }
-    self.maybe_load_more();
+        Err(error) => log::warn!("album art failed: {error}"),
+      }
+    });
   }
 
   pub fn set_art(&mut self, video_id: String, protocol: StatefulProtocol) {
@@ -262,79 +158,36 @@ impl Player {
     }
   }
 
-  pub fn on_finished(&mut self, generation: u64, result: Result<(), String>) {
-    if generation != self.generation {
-      return;
-    }
-    match result {
-      Err(error) => {
-        log::error!("playback failed: {error}");
-        self.error = Some(error);
+  /// Sends a command to the daemon. What it does arrives as the next view.
+  pub fn send(&self, command: Command) {
+    let tx = self.tx.clone();
+    tokio::spawn(async move {
+      if let Err(error) = client::call(Request::Control(command)).await {
+        let _ = tx.send(Msg::CommandFailed(error.to_string()));
       }
-      Ok(()) if self.index + 1 < self.queue.len() => self.play_index(self.index + 1),
-      Ok(()) => {
-        self.finished = true;
-        self.started = None;
-      }
+    });
+  }
+
+  /// Replaces the queue with the song radio of `seed`.
+  pub fn start_radio(&self, seed: Track) { self.send(Command::StartRadio { seed }); }
+
+  pub fn play_index(&self, index: usize) {
+    if let Some(track) = self.view.queue.get(index) {
+      self.send(Command::JumpTo { index, video_id: track.video_id.clone() });
     }
   }
 
-  pub fn next(&mut self) {
-    if self.index + 1 < self.queue.len() {
-      self.play_index(self.index + 1);
-    }
-  }
+  pub fn play_cursor(&self) { self.play_index(self.cursor); }
 
-  pub fn previous(&mut self) {
-    if self.index == 0 || self.elapsed() > RESTART_AFTER {
-      self.play_index(self.index);
-    } else {
-      self.play_index(self.index - 1);
-    }
-  }
+  pub fn next(&self) { self.send(Command::Next); }
 
-  pub fn play_cursor(&mut self) { self.play_index(self.cursor); }
+  pub fn previous(&self) { self.send(Command::Previous); }
+
+  pub fn toggle_pause(&self) { self.send(Command::Toggle); }
 
   pub fn move_cursor(&mut self, delta: isize) {
-    self.cursor = self.cursor.saturating_add_signed(delta).min(self.queue.len().saturating_sub(1));
-  }
-
-  pub fn toggle_pause(&mut self) {
-    if self.current().is_none() || self.finished || self.error.is_some() {
-      return;
-    }
-    self.paused = !self.paused;
-    if !self.begun {
-      return; // `tick` applies it once ffplay is running.
-    }
-    if self.paused {
-      self.accum = self.elapsed();
-      self.started = None;
-      self.signal(libc::SIGSTOP);
-    } else {
-      self.started = Some(Instant::now());
-      self.signal(libc::SIGCONT);
-    }
-  }
-
-  fn signal(&self, signal: i32) {
-    let pid = self.pid.load(Ordering::SeqCst);
-    if pid != 0 {
-      // SAFETY: plain syscall; a stale pid only fails.
-      unsafe { libc::kill(pid as i32, signal) };
-    }
-  }
-
-  /// Notices when ffplay has started, which is when the clock starts.
-  pub fn tick(&mut self) {
-    if !self.begun && self.pid.load(Ordering::SeqCst) != 0 {
-      self.begun = true;
-      if self.paused {
-        self.signal(libc::SIGSTOP);
-      } else {
-        self.started = Some(Instant::now());
-      }
-    }
+    self.cursor =
+      self.cursor.saturating_add_signed(delta).min(self.view.queue.len().saturating_sub(1));
   }
 
   /// Draws the expanded player: album art on the left, the queue on the right.
@@ -355,10 +208,13 @@ impl Player {
       ),
     }
 
-    let seed = self.queue.first().map_or("", |track| track.title.as_str());
-    let block = Block::bordered()
-      .title(format!(" Radio: {seed} "))
-      .border_style(Style::default().fg(Color::Cyan));
+    let seed = self.view.queue.first().map_or("", |track| track.title.as_str());
+    let title = match &self.view.source {
+      Source::Radio { .. } => format!(" Radio: {seed} "),
+      Source::Playlist { .. } => " Playlist ".to_owned(),
+      Source::None => " Queue ".to_owned(),
+    };
+    let block = Block::bordered().title(title).border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(right);
     frame.render_widget(block, right);
     hits.push(Hit { rect: right, target: Target::Queue(None) });
@@ -369,14 +225,20 @@ impl Player {
     } else if self.cursor >= self.offset + rows {
       self.offset = self.cursor + 1 - rows;
     }
-    for (slot, idx) in (self.offset..self.queue.len()).take(rows).enumerate() {
+    for (slot, idx) in (self.offset..self.view.queue.len()).take(rows).enumerate() {
       let rect = Rect {
         x:      inner.x,
         y:      inner.y + slot as u16 * ITEM_HEIGHT,
         width:  inner.width,
         height: ITEM_HEIGHT.min(inner.height),
       };
-      ui::render_track(frame, rect, &self.queue[idx], idx == self.cursor, idx == self.index);
+      ui::render_track(
+        frame,
+        rect,
+        &self.view.queue[idx],
+        idx == self.cursor,
+        idx == self.view.index,
+      );
       hits.push(Hit { rect, target: Target::Queue(Some(idx)) });
     }
   }
@@ -394,10 +256,10 @@ fn art_url(thumbnails: &[Thumbnail]) -> Option<String> {
   }
 }
 
-async fn fetch_art(
-  http: &st_api::Client,
-  url: &str,
-) -> Result<image::DynamicImage, Box<dyn std::error::Error + Send + Sync>> {
-  let bytes = http.get(url).send().await?.error_for_status()?.bytes().await?;
+async fn fetch_art(url: String) -> Result<image::DynamicImage, client::BoxError> {
+  let bytes = match client::call(Request::Art { url }).await? {
+    st_proto::ipc::Response::Art(bytes) => bytes,
+    other => return Err(format!("the daemon sent an unexpected response: {other:?}").into()),
+  };
   Ok(tokio::task::spawn_blocking(move || image::load_from_memory(&bytes)).await??)
 }
