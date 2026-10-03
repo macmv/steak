@@ -312,6 +312,27 @@ fn event_input(state: &mut State, event: Event, now: Instant, effects: &mut Vec<
       } else {
         // A radio opens with its seed, which is already queued (and playing).
         let seed = state.queue.first().map(|track| track.video_id.clone());
+        // The seed may be a bare stub (a home card, or just an ID); the
+        // batch's copy of it knows its length and artists.
+        if let Some(full) = batch.tracks.iter().find(|t| Some(&t.video_id) == seed.as_ref()) {
+          if let Some(first) = state.queue.first_mut() {
+            if first.title == first.video_id {
+              first.title = full.title.clone();
+            }
+            if first.duration.is_none() {
+              first.duration = full.duration.clone();
+            }
+            if first.artists.is_empty() {
+              first.artists = full.artists.clone();
+            }
+            if first.album.is_none() {
+              first.album = full.album.clone();
+            }
+            if first.thumbnails.is_empty() {
+              first.thumbnails = full.thumbnails.clone();
+            }
+          }
+        }
         state.append_new(batch.tracks.into_iter().filter(|t| Some(&t.video_id) != seed.as_ref()));
         state.continuation = batch.continuation;
         state.maybe_load_more(effects);
@@ -551,6 +572,22 @@ mod tests {
     rig.command(Command::Toggle);
     assert!(rig.started().is_empty());
     assert_eq!(*rig.state.transport(), Transport::Playing);
+  }
+
+  #[test]
+  fn a_radio_gives_its_seed_the_length_it_lacked() {
+    let mut rig = Rig::new();
+    rig.command(Command::StartRadio { seed: track("a") });
+    let load_id = rig.state.load_id;
+    let mut full = track("a");
+    full.duration = Some("3:34".into());
+    rig.event(Event::QueueLoaded {
+      load_id,
+      more: false,
+      result: Ok(Batch { tracks: vec![full, track("b")], continuation: None }),
+    });
+    assert_eq!(rig.state.queue[0].duration.as_deref(), Some("3:34"));
+    assert_eq!(rig.ids(), vec!["a", "b"]);
   }
 
   #[test]
