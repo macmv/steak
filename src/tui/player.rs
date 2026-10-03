@@ -14,7 +14,7 @@ use ratatui::{
   Frame,
   layout::{Constraint, Layout, Rect},
   style::{Color, Style},
-  widgets::{Block, Paragraph},
+  widgets::Paragraph,
 };
 use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
 use st_proto::{
@@ -247,9 +247,8 @@ impl Player {
     let [left, right] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(area);
 
     let album = self.current().and_then(|t| t.album.as_ref()).map(|a| a.name.clone());
-    let block = Block::bordered().title(format!(" {} ", album.as_deref().unwrap_or("Album art")));
-    let inner = block.inner(left);
-    frame.render_widget(block, left);
+    let left = Rect { width: left.width.saturating_sub(2), ..left };
+    let inner = ui::render_section(frame, left, album.as_deref().unwrap_or("Album art"), false);
     match &mut self.art {
       Some((_, protocol)) => {
         frame.render_stateful_widget(StatefulImage::default(), inner, protocol)
@@ -262,13 +261,11 @@ impl Player {
 
     let seed = self.view.queue.first().map_or("", |track| track.title.as_str());
     let title = match &self.view.source {
-      Source::Radio { .. } => format!(" Radio: {seed} "),
-      Source::Playlist { .. } => " Playlist ".to_owned(),
-      Source::None => " Queue ".to_owned(),
+      Source::Radio { .. } => format!("Radio: {seed}"),
+      Source::Playlist { .. } => "Playlist".to_owned(),
+      Source::None => "Queue".to_owned(),
     };
-    let block = Block::bordered().title(title).border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(right);
-    frame.render_widget(block, right);
+    let inner = ui::render_section(frame, right, &title, true);
     hits.push(Hit { rect: right, target: Target::Queue(None) });
 
     let rows = ((inner.height / ITEM_HEIGHT) as usize).max(1);

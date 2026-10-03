@@ -38,7 +38,7 @@ use crate::client;
 const HOME_PAGES: u32 = 3;
 /// How long to wait before trying to reach the daemon again.
 const RECONNECT_AFTER: Duration = Duration::from_secs(1);
-const STATUS_BAR_HEIGHT: u16 = 4;
+const STATUS_BAR_HEIGHT: u16 = 3;
 
 /// Results of background work, delivered to the event loop.
 pub enum Msg {
@@ -185,6 +185,14 @@ impl App {
 
   fn draw(&mut self, frame: &mut Frame) {
     self.hits.clear();
+    frame.render_widget(
+      ratatui::widgets::Block::new().style(
+        ratatui::style::Style::new()
+          .bg(ratatui::style::Color::Black)
+          .fg(ratatui::style::Color::White),
+      ),
+      frame.area(),
+    );
     let [main, bar] = Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_BAR_HEIGHT)])
       .areas(frame.area());
     let hint = match self.screen {

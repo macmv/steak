@@ -3,8 +3,7 @@
 use ratatui::{
   Frame,
   layout::{Constraint, Layout, Rect},
-  style::{Color, Style},
-  widgets::{Block, Paragraph},
+  widgets::Paragraph,
 };
 use st_proto::catalog::{Artist, Card, Shelf, ShelfItem, Track};
 
@@ -140,12 +139,10 @@ impl Home {
     for (area, index) in areas.iter().zip(self.first..) {
       let active = index == self.col;
       let column = &mut self.columns[index];
-      let border = if active { Color::Cyan } else { Color::DarkGray };
-      let block = Block::bordered()
-        .title(format!(" {} ", column.title))
-        .border_style(Style::default().fg(border));
-      let inner = block.inner(*area);
-      frame.render_widget(block, *area);
+      // Pad the column so neighbors are separated by whitespace instead of
+      // borders.
+      let padded = Rect { width: area.width.saturating_sub(2), ..*area };
+      let inner = ui::render_section(frame, padded, &column.title, active);
       hits.push(Hit { rect: *area, target: Target::HomeColumn(index) });
 
       let rows = ((inner.height / ITEM_HEIGHT) as usize).max(1);

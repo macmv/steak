@@ -7,7 +7,7 @@ use ratatui::{
   layout::{Constraint, Layout, Rect},
   style::{Color, Modifier, Style},
   text::{Line, Span},
-  widgets::{Block, LineGauge, Paragraph},
+  widgets::{LineGauge, Paragraph},
 };
 use st_proto::catalog::Track;
 
@@ -15,6 +15,9 @@ use super::{
   Hit, Target,
   player::{Player, Status},
 };
+
+/// Background of the selected row, a dark gray that still reads on black.
+const SELECTED_BG: Color = Color::Rgb(38, 38, 38);
 
 pub fn artists(track: &Track) -> String {
   track.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
@@ -45,8 +48,8 @@ pub fn render_track(frame: &mut Frame, area: Rect, track: &Track, selected: bool
     title = title.fg(Color::Green);
   }
   if selected {
-    title = title.bg(Color::DarkGray);
-    detail = detail.bg(Color::DarkGray);
+    title = title.bg(SELECTED_BG);
+    detail = detail.bg(SELECTED_BG);
   }
   let marker = if playing { "> " } else { "  " };
   let mut subtitle = artists(track);
@@ -64,6 +67,17 @@ pub fn render_track(frame: &mut Frame, area: Rect, track: &Track, selected: bool
   );
 }
 
+/// Draws a borderless section: a bold title line, returning the area below it.
+pub fn render_section(frame: &mut Frame, area: Rect, title: &str, active: bool) -> Rect {
+  let color = if active { Color::Cyan } else { Color::DarkGray };
+  let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+  frame.render_widget(
+    Paragraph::new(title.to_owned()).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+    head,
+  );
+  body
+}
+
 /// The always-visible player status at the bottom of the screen.
 pub fn render_status_bar(
   frame: &mut Frame,
@@ -73,10 +87,10 @@ pub fn render_status_bar(
   hits: &mut Vec<Hit>,
 ) {
   hits.push(Hit { rect: area, target: Target::Status });
-  let block = Block::bordered().title(" steak ").title_bottom(Line::from(hint).right_aligned());
-  let inner = block.inner(area);
-  frame.render_widget(block, area);
-  let [top, bottom] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+  let [top, bottom, help] =
+    Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+      .areas(area);
+  frame.render_widget(Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)), help);
 
   let (state, style) = match player.status() {
     Status::Idle => ("Nothing playing".to_owned(), Style::default().fg(Color::Gray)),
