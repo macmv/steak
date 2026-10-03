@@ -164,11 +164,15 @@ impl App {
       terminal.draw(|frame| self.draw(frame))?;
       // Redraw when the clock ticks over. Everything else redraws because a
       // key or a message arrived.
-      let tick = self.player.until_next_second();
+      let tick = [self.player.until_next_second(), self.player.until_images_return()]
+        .into_iter()
+        .flatten()
+        .min();
       tokio::select! {
         Some(event) = events.next() => match event? {
           Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
           Event::Mouse(mouse) => self.on_mouse(mouse),
+          Event::Resize(..) => self.player.on_resize(),
           _ => {}
         },
         Some(msg) = rx.recv() => self.on_msg(msg),

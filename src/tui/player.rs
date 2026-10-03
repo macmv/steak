@@ -32,6 +32,8 @@ const ITEM_HEIGHT: u16 = 2;
 /// cells because cells are about twice as tall as they are wide.
 const COVER_WIDTH: u16 = 4;
 const COVER_GAP: u16 = 1;
+/// How long the window must stay the same size before images are drawn again.
+const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
@@ -67,6 +69,11 @@ pub struct Player {
   covers:        HashMap<String, StatefulProtocol>,
   /// The covers loading or loaded, so each is requested once.
   covers_wanted: HashSet<String>,
+
+  /// Images are not drawn until this passes. Every size they are drawn at
+  /// costs a re-encode and a transfer to the terminal, so while the window is
+  /// being dragged they stay out, and come back once it settles.
+  hidden_until: Option<Instant>,
 }
 
 impl Player {
@@ -83,6 +90,7 @@ impl Player {
       art_wanted: None,
       covers: HashMap::new(),
       covers_wanted: HashSet::new(),
+      hidden_until: None,
     }
   }
 
@@ -128,6 +136,18 @@ impl Player {
       }
       _ => None,
     }
+  }
+
+  /// The window changed size: take the images off screen until it stops.
+  pub fn on_resize(&mut self) { self.hidden_until = Some(Instant::now() + RESIZE_SETTLE); }
+
+  fn images_visible(&self) -> bool { self.hidden_until.is_none_or(|until| Instant::now() >= until) }
+
+  /// How long until the images come back after a resize, if they are away.
+  pub fn until_images_return(&self) -> Option<Duration> {
+    let wait = self.hidden_until?.checked_duration_since(Instant::now())?;
+    // A hair late, so the deadline has certainly passed.
+    Some(wait + Duration::from_millis(2))
   }
 
   pub fn duration(&self) -> Option<Duration> {
@@ -249,13 +269,16 @@ impl Player {
     let album = self.current().and_then(|t| t.album.as_ref()).map(|a| a.name.clone());
     let left = Rect { width: left.width.saturating_sub(2), ..left };
     let inner = ui::render_section(frame, left, album.as_deref().unwrap_or("Album art"), false);
+    let show = self.images_visible();
     match &mut self.art {
-      Some((_, protocol)) => {
+      Some((_, protocol)) if show => {
         // `Scale`, not the default `Fit`: `Fit` never enlarges an image past
         // its own pixel size, so the art could not grow with the window.
         let image = StatefulImage::default().resize(Resize::Scale(None));
         frame.render_stateful_widget(image, centered_square(inner), protocol)
       }
+      // Hidden while the window is being resized.
+      Some(_) => {}
       None => frame.render_widget(
         Paragraph::new("No album art").style(Style::default().fg(Color::DarkGray)).centered(),
         inner,
@@ -287,7 +310,7 @@ impl Player {
       let track = self.view.queue[idx].clone();
       self.request_cover(&track);
       let cover = Rect { width: COVER_WIDTH.min(rect.width), ..rect };
-      if let Some(protocol) = self.covers.get_mut(&track.video_id) {
+      if let Some(protocol) = self.covers.get_mut(&track.video_id).filter(|_| show) {
         frame.render_stateful_widget(StatefulImage::default(), cover, protocol);
       }
       let text_x = COVER_WIDTH + COVER_GAP;
