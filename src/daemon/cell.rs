@@ -53,7 +53,6 @@ use std::{
 };
 
 use log::{debug, info, warn};
-use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 /// How a cell treats its value over time. Each cell states its own policy next
@@ -351,17 +350,7 @@ impl<T> Machine<T> {
   }
 }
 
-/// A snapshot of one cell for `steak status`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CellReport {
-  pub name:                 String,
-  pub state:                String,
-  pub generation:           Option<u64>,
-  pub age_secs:             Option<u64>,
-  pub consecutive_failures: u32,
-  pub last_error:           Option<String>,
-  pub retry_in_secs:        Option<u64>,
-}
+pub use st_proto::ipc::CellReport;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type Fetch<T> = Arc<dyn Fn() -> BoxFuture<Result<T, String>> + Send + Sync>;

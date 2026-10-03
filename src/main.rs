@@ -6,16 +6,13 @@
 
 mod client;
 mod daemon;
-mod ipc;
 
 use std::{error::Error, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand};
-use st_api::catalog::{ShelfItem, Track};
-
-use crate::{
-  daemon::{cell::CellReport, session::SessionReport},
-  ipc::{PlaybackState, Request, Response},
+use st_proto::{
+  catalog::{ShelfItem, Track},
+  ipc::{CellReport, Command, PlayerView, Request, Response, SessionReport, Transport},
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -62,8 +59,38 @@ enum CliCommand {
     /// YouTube video ID to play.
     video_id: String,
   },
+  /// Play a song, and the radio YouTube Music builds from it after it.
+  PlayRadio {
+    /// YouTube video ID to start the radio from.
+    video_id: String,
+  },
+  /// Play a playlist or album, replacing whatever is playing.
+  PlayPlaylist {
+    /// Playlist ID, or the browse ID shown by `steak home` (`VL...`).
+    playlist_id: String,
+  },
+  /// Pause playback.
+  Pause,
+  /// Resume playback.
+  Resume,
+  /// Pause if playing, resume if paused.
+  Toggle,
+  /// Skip to the next track.
+  Next,
+  /// Go back to the previous track, or restart this one if it just started.
+  Prev,
   /// Stop playback.
   Stop,
+  /// Show the player: what is playing, and the queue.
+  Queue,
+  /// Save a song's audio as an mp4 file, using `ffmpeg`.
+  Download {
+    /// YouTube video ID to download.
+    video_id: String,
+    /// Output file (defaults to `<video_id>.mp4`).
+    #[arg(short, long)]
+    output:   Option<PathBuf>,
+  },
 }
 
 #[derive(Debug, Args)]
@@ -199,17 +226,56 @@ async fn run() -> Result<()> {
     CliCommand::Playlist { playlist_id, more } => {
       tracks(client::call(Request::Playlist { playlist_id, more }).await?)
     }
-    CliCommand::Play { video_id } => match client::call(Request::Play { video_id }).await? {
-      Response::Playing { video_id } => {
-        println!("playing {video_id}");
+    CliCommand::Play { video_id } => control(Command::Play { video_id }).await,
+    CliCommand::PlayRadio { video_id } => {
+      // The daemon builds the queue; the seed only needs its ID to start.
+      let seed = Track {
+        title: video_id.clone(),
+        video_id,
+        artists: Vec::new(),
+        album: None,
+        duration: None,
+        thumbnails: Vec::new(),
+        watch: None,
+      };
+      control(Command::StartRadio { seed }).await
+    }
+    CliCommand::PlayPlaylist { playlist_id } => {
+      control(Command::StartPlaylist { playlist_id }).await
+    }
+    CliCommand::Pause => control(Command::Pause).await,
+    CliCommand::Resume => control(Command::Resume).await,
+    CliCommand::Toggle => control(Command::Toggle).await,
+    CliCommand::Next => control(Command::Next).await,
+    CliCommand::Prev => control(Command::Previous).await,
+    CliCommand::Stop => control(Command::Stop).await,
+    CliCommand::Queue => match client::call(Request::Status).await? {
+      Response::Status(status) => {
+        print_player(&status.player, true);
         Ok(())
       }
       other => unexpected(other),
     },
-    CliCommand::Stop => match client::call(Request::Stop).await? {
-      Response::Stopped => Ok(()),
-      other => unexpected(other),
-    },
+    CliCommand::Download { video_id, output } => {
+      let output = output.unwrap_or_else(|| format!("{video_id}.mp4").into());
+      // The daemon has its own working directory.
+      let output = std::path::absolute(output)?;
+      match client::call(Request::Download { video_id, output: output.clone() }).await? {
+        Response::Ok => {
+          println!("saved {}", output.display());
+          Ok(())
+        }
+        other => unexpected(other),
+      }
+    }
+  }
+}
+
+/// Sends a player command and waits for the daemon to accept it.
+async fn control(command: Command) -> Result<()> {
+  match client::call(Request::Control(command)).await? {
+    Response::Ok => Ok(()),
+    other => unexpected(other),
   }
 }
 
@@ -233,22 +299,41 @@ fn print_track(track: &Track) {
   println!("  {} -- {} [{}]{duration}", track.title, artists.join(", "), track.video_id);
 }
 
-fn print_status(status: &ipc::StatusReport) {
+fn print_status(status: &st_proto::ipc::StatusReport) {
   println!("steak daemon {} (up {})", status.version, duration(status.uptime_secs));
-  match &status.playback {
-    PlaybackState::Idle => println!("playback: idle"),
-    PlaybackState::Resolving { video_id } => println!("playback: starting {video_id}"),
-    PlaybackState::Playing { video_id } => println!("playback: playing {video_id}"),
-    PlaybackState::Failed { video_id, error } => {
-      println!("playback: failed to play {video_id}: {error}")
-    }
-  }
+  print_player(&status.player, false);
   print_session(&status.session);
   println!("caches:");
   for cache in &status.caches {
     print_cache(cache);
   }
 }
+
+fn print_player(player: &PlayerView, queue: bool) {
+  let title = player.current().map_or("nothing".to_owned(), |track| {
+    let artists = track.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>();
+    format!("{} -- {}", track.title, artists.join(", "))
+  });
+  match &player.transport {
+    Transport::Idle => println!("playback: idle"),
+    Transport::Loading => println!("playback: starting {title}"),
+    Transport::Playing => println!("playback: playing {title} ({})", clock(player.position_ms)),
+    Transport::Paused => println!("playback: paused {title} ({})", clock(player.position_ms)),
+    Transport::Ended => println!("playback: finished {title}"),
+    Transport::Failed(error) => println!("playback: failed to play {title}: {error}"),
+  }
+  if queue {
+    for (index, track) in player.queue.iter().enumerate() {
+      let marker = if index == player.index { ">" } else { " " };
+      print!("{marker}");
+      print_track(track);
+    }
+  } else if !player.queue.is_empty() {
+    println!("  track {} of {} in the queue", player.index + 1, player.queue.len());
+  }
+}
+
+fn clock(ms: u64) -> String { format!("{}:{:02}", ms / 60_000, ms / 1000 % 60) }
 
 fn print_session(session: &SessionReport) {
   println!("session: {}", session.state);

@@ -20,7 +20,9 @@ use st_api::{
   },
 };
 
-use super::Daemon;
+use st_proto::ipc::Source;
+
+use super::{Daemon, machine::Batch};
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -105,6 +107,38 @@ impl Daemon {
       response = client.browse_continuation(token).await?;
     }
     Ok(all)
+  }
+
+  /// One batch of a player queue: the first (`token: None`) or the one after
+  /// `token`.
+  pub async fn load_queue(
+    &self,
+    source: &Source,
+    token: Option<String>,
+  ) -> Result<Batch, BoxError> {
+    let (client, _) = self.client().await?;
+    match source {
+      Source::None => Err("this queue does not grow".into()),
+      Source::Radio { seed } => {
+        let response = match token {
+          Some(token) => client.next_continuation(token).await?,
+          None => client.next(seed, Some(format!("RDAMVM{seed}"))).await?,
+        };
+        Ok(Batch {
+          tracks:       QueueParser.tracks(&response),
+          continuation: QueueParser.continuation(&response),
+        })
+      }
+      Source::Playlist { playlist_id } => {
+        let playlist_id = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
+        let response = match token {
+          Some(token) => client.browse_continuation(token).await?,
+          None => client.browse(format!("VL{playlist_id}"), None).await?,
+        };
+        let tracks = PlaylistParser.tracks(&response);
+        Ok(Batch { tracks, continuation: PlaylistParser.continuation(&response) })
+      }
+    }
   }
 
   /// Resolves `video_id` to a signed URL that googlevideo serves in full, and

@@ -52,7 +52,6 @@ use std::{
 };
 
 use log::{debug, info, warn};
-use serde::{Deserialize, Serialize};
 use st_api::account::{
   firefox,
   session::{self, StoredSession},
@@ -307,15 +306,7 @@ pub struct SessionLease {
 pub type Verifier =
   Arc<dyn Fn(Arc<StoredSession>) -> BoxFuture<Result<Verdict, String>> + Send + Sync>;
 
-/// A snapshot for `steak status`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SessionReport {
-  pub state:                 String,
-  pub detail:                Option<String>,
-  pub source:                Option<String>,
-  pub last_import_secs:      Option<u64>,
-  pub next_auto_repair_secs: Option<u64>,
-}
+pub use st_proto::ipc::SessionReport;
 
 pub struct Session {
   machine:     Mutex<Machine>,

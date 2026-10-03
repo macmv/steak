@@ -10,12 +10,15 @@ use std::{future::Future, path::Path, sync::Arc, time::Duration};
 use log::{debug, info, warn};
 use tokio::{
   io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-  net::{UnixListener, UnixStream},
+  net::{
+    UnixListener, UnixStream,
+    unix::{OwnedReadHalf, OwnedWriteHalf},
+  },
   sync::Semaphore,
 };
 
 use super::Daemon;
-use crate::ipc::{Request, Response};
+use st_proto::ipc::{Request, Response};
 
 /// Requests are one short line; anything bigger is not a client of ours.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
@@ -26,11 +29,14 @@ const MAX_CONNECTIONS: usize = 64;
 /// How long each kind of request may run before it is answered with an error.
 fn deadline(request: &Request) -> Duration {
   match request {
-    Request::Ping | Request::Status | Request::Stop => Duration::from_secs(10),
+    Request::Ping | Request::Status | Request::Control(_) | Request::Subscribe => {
+      Duration::from_secs(10)
+    }
+    Request::Art { .. } => Duration::from_secs(30),
     Request::Home { .. } | Request::Radio { .. } | Request::Playlist { .. } => {
       Duration::from_secs(90)
     }
-    Request::Play { .. } => Duration::from_secs(200),
+    Request::Download { .. } => Duration::from_secs(30 * 60),
     Request::AuthImport { .. } | Request::AuthRepair => Duration::from_secs(150),
   }
 }
@@ -98,21 +104,28 @@ pub async fn serve(
 
 async fn connection(stream: UnixStream, daemon: Arc<Daemon>) {
   let (reader, mut writer) = stream.into_split();
+  let mut reader = BufReader::new(reader);
   let mut line = String::new();
-  let read = tokio::time::timeout(
-    READ_TIMEOUT,
-    BufReader::new(reader.take(MAX_REQUEST_BYTES)).read_line(&mut line),
-  )
-  .await;
+  let read =
+    tokio::time::timeout(READ_TIMEOUT, (&mut reader).take(MAX_REQUEST_BYTES).read_line(&mut line))
+      .await;
   let response = match read {
     Ok(Ok(0)) | Err(_) => return, // Connected and said nothing.
     Ok(Err(error)) => Response::Error(format!("could not read the request: {error}")),
     Ok(Ok(_)) => match serde_json::from_str::<Request>(&line) {
+      Ok(Request::Subscribe) => return subscribe(reader, writer, daemon).await,
       Ok(request) => run(request, daemon).await,
       Err(error) => Response::Error(format!("malformed request: {error}")),
     },
   };
-  let bytes = match serde_json::to_vec(&response) {
+  if write_response(&mut writer, &response).await {
+    let _ = writer.shutdown().await;
+  }
+}
+
+/// Writes one response line. False if the client is gone or stopped reading.
+async fn write_response(writer: &mut OwnedWriteHalf, response: &Response) -> bool {
+  let bytes = match serde_json::to_vec(response) {
     Ok(mut bytes) => {
       bytes.push(b'\n');
       bytes
@@ -121,15 +134,44 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) {
       format!("{{\"Error\":\"could not encode the response: {error}\"}}\n").into_bytes()
     }
   };
-  let write = async {
-    writer.write_all(&bytes).await?;
-    writer.shutdown().await
-  };
-  match tokio::time::timeout(WRITE_TIMEOUT, write).await {
-    Ok(Ok(())) => {}
+  match tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&bytes)).await {
+    Ok(Ok(())) => true,
     // The client went away (Ctrl-C on a slow command, say). Nothing to do.
-    Ok(Err(error)) => debug!("client went away before the response: {error}"),
-    Err(_) => debug!("client did not read the response"),
+    Ok(Err(error)) => {
+      debug!("client went away before the response: {error}");
+      false
+    }
+    Err(_) => {
+      debug!("client did not read the response");
+      false
+    }
+  }
+}
+
+/// Streams the player's view until the client goes away.
+///
+/// The view comes from a `watch` channel, so a client that reads slowly skips
+/// the snapshots it missed instead of making anyone wait or buffering them; a
+/// client that stops reading altogether hits the write timeout and is dropped.
+async fn subscribe(
+  mut reader: BufReader<OwnedReadHalf>,
+  mut writer: OwnedWriteHalf,
+  daemon: Arc<Daemon>,
+) {
+  debug!("a client subscribed to the player");
+  let mut view = daemon.player.subscribe();
+  let mut ignored = String::new();
+  loop {
+    let snapshot = view.borrow_and_update().clone();
+    if !write_response(&mut writer, &Response::Player(snapshot)).await {
+      return;
+    }
+    tokio::select! {
+      changed = view.changed() => if changed.is_err() { return },
+      // The client said something more, or hung up. A subscriber has nothing
+      // more to say, so either way it is done.
+      _ = reader.read_line(&mut ignored) => return,
+    }
   }
 }
 

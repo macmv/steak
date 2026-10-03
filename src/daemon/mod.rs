@@ -13,7 +13,8 @@
 //! | `session.rs`  | the YouTube session           | Absent, Unverified, Valid, Invalid           |
 //! | `cell.rs`     | every cache (generic)         | Empty, Refreshing, Ready, Backoff            |
 //! | `caches.rs`   | which caches exist, and their ttl/backoff/dependencies | |
-//! | `playback.rs` | what is playing               | Idle, Resolving, Playing, Failed             |
+//! | `machine.rs`  | what is playing (queue, track, clock) | Idle, Loading, Playing, Paused, Ended, Failed |
+//! | `player.rs`   | the actor that owns `machine.rs`'s state and runs its effects | |
 //!
 //! # Robustness
 //!
@@ -40,12 +41,15 @@
 //!    the process (`steak daemon install` sets `Restart=always`).
 
 pub mod api;
+pub mod art;
 pub mod audio;
 pub mod caches;
 pub mod cell;
 pub mod config;
+pub mod download;
+pub mod machine;
 pub mod paths;
-pub mod playback;
+pub mod player;
 pub mod server;
 pub mod service;
 pub mod session;
@@ -58,19 +62,20 @@ use std::{
 use futures_util::FutureExt;
 use log::{error, info, warn};
 
-use crate::ipc::{Request, Response, StatusReport};
 use caches::Caches;
-use playback::Playback;
+use player::Player;
 use session::Session;
+use st_proto::ipc::{Command, Request, Response, StatusReport};
 
 /// How often the keeper starts due refreshes and repairs.
 const KEEPER_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct Daemon {
-  pub caches:   Arc<Caches>,
-  pub session:  Arc<Session>,
-  pub playback: Arc<Playback>,
-  started:      Instant,
+  pub caches:  Arc<Caches>,
+  pub session: Arc<Session>,
+  pub player:  Player,
+  art:         art::ArtCache,
+  started:     Instant,
 }
 
 impl Daemon {
@@ -84,7 +89,14 @@ impl Daemon {
       })
     };
     let session = Session::new(config::Config::load(), verifier);
-    Arc::new(Self { caches, session, playback: Playback::new(), started: Instant::now() })
+    // The player reaches YouTube through the daemon, which owns the player.
+    Arc::new_cyclic(|me| Self {
+      caches,
+      session,
+      player: Player::spawn(me.clone()),
+      art: art::ArtCache::default(),
+      started: Instant::now(),
+    })
   }
 
   pub async fn handle(self: Arc<Self>, request: Request) -> Response {
@@ -105,10 +117,26 @@ impl Daemon {
         Ok(tracks) => Response::Tracks(tracks),
         Err(error) => failed(error),
       },
-      Request::Play { video_id } => self.play(video_id).await,
-      Request::Stop => {
-        self.playback.stop();
-        Response::Stopped
+      Request::Control(command) => {
+        self.player.command(command);
+        Response::Ok
+      }
+      // Streaming a connection is the server's job; see `server::connection`.
+      Request::Subscribe => Response::Player(self.player.view()),
+      Request::Art { url } => match self.art.fetch(&self.caches.http, &url).await {
+        Ok(image) => Response::Art(image),
+        Err(error) => failed(error),
+      },
+      Request::Download { video_id, output } => {
+        info!("downloading {video_id} to {}", output.display());
+        let result = match self.open_audio(&video_id).await {
+          Ok(audio) => download::save(audio, &output).await,
+          Err(error) => Err(error.to_string()),
+        };
+        match result {
+          Ok(()) => Response::Ok,
+          Err(error) => failed(error),
+        }
       }
       Request::AuthImport { profile } => {
         let result = match profile.or_else(|| self.session.source()) {
@@ -129,27 +157,11 @@ impl Daemon {
     }
   }
 
-  /// Starts playing `video_id` and answers once audio is coming out or it
-  /// failed to start.
-  async fn play(self: &Arc<Self>, video_id: String) -> Response {
-    let daemon = self.clone();
-    let id = video_id.clone();
-    let generation = self.playback.start(video_id.clone(), move |started| async move {
-      info!("playing {id}");
-      let audio = daemon.open_audio(&id).await.map_err(|error| error.to_string())?;
-      audio::play_stream(audio, || started.mark()).await
-    });
-    match self.playback.wait_for_start(generation, Duration::from_secs(190)).await {
-      Ok(()) => Response::Playing { video_id },
-      Err(error) => Response::Error(error),
-    }
-  }
-
   pub fn status(&self) -> StatusReport {
     StatusReport {
       version:     env!("CARGO_PKG_VERSION").into(),
       uptime_secs: self.started.elapsed().as_secs(),
-      playback:    self.playback.state(),
+      player:      self.player.view(),
       session:     self.session.report(),
       caches:      self.caches.reports(),
     }
@@ -186,7 +198,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
   server::serve(listener, daemon.clone(), shutdown_signal()).await;
 
   info!("shutting down");
-  daemon.playback.stop();
+  daemon.player.command(Command::Stop);
+  // Let the player task kill the audio process before the process exits.
+  tokio::time::sleep(Duration::from_millis(200)).await;
   let _ = std::fs::remove_file(&socket);
   Ok(())
 }

@@ -1,40 +1,10 @@
 //! Conversion of Music search and home renderer trees into stable catalog
 //! objects.
 
-use crate::innertube::client::WatchEndpoint;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-/// A track returned by YouTube Music search.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Track {
-  pub video_id:   String,
-  pub title:      String,
-  pub artists:    Vec<Artist>,
-  pub album:      Option<Album>,
-  pub duration:   Option<String>,
-  pub thumbnails: Vec<Thumbnail>,
-  pub watch:      Option<WatchEndpoint>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Artist {
-  pub id:   Option<String>,
-  pub name: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Album {
-  pub id:   Option<String>,
-  pub name: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Thumbnail {
-  pub url:    String,
-  pub width:  Option<u32>,
-  pub height: Option<u32>,
-}
+pub use st_proto::catalog::{
+  Album, Artist, Card, Shelf, ShelfItem, Thumbnail, Track, WatchEndpoint,
+};
 
 /// Extracts song/video rows from a raw `search` response.
 #[derive(Clone, Debug, Default)]
@@ -46,29 +16,6 @@ impl SearchParser {
     find_music_rows(response, &mut rows);
     rows.into_iter().filter_map(parse_track).collect()
   }
-}
-
-/// A row of the Music homepage, such as "Quick picks" or "Listen again".
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Shelf {
-  pub title: String,
-  pub items: Vec<ShelfItem>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ShelfItem {
-  Track(Track),
-  Card(Card),
-}
-
-/// A shelf entry that is not a plain track row: an album, playlist, artist,
-/// or a video/radio card.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Card {
-  pub title:     String,
-  pub subtitle:  String,
-  pub browse_id: Option<String>,
-  pub watch:     Option<WatchEndpoint>,
 }
 
 /// Extracts shelves from a raw `browse` response for the home page, or from one

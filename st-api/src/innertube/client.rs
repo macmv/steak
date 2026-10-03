@@ -6,7 +6,7 @@
 
 use log::debug;
 use reqwest::{Client, Url, header};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 const BASE_URL: &str = "https://music.youtube.com/youtubei/v1/";
@@ -27,14 +27,7 @@ pub enum Endpoint {
   PlaylistEdit,
 }
 
-/// Navigation state carried by a search or queue item's watch endpoint.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct WatchEndpoint {
-  pub video_id:              String,
-  pub playlist_id:           Option<String>,
-  pub params:                Option<String>,
-  pub click_tracking_params: Option<String>,
-}
+pub use st_proto::catalog::WatchEndpoint;
 
 impl Endpoint {
   fn path(self) -> &'static str {

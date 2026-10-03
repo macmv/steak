@@ -17,9 +17,9 @@ const READ_AHEAD: usize = 64;
 
 /// Aborts a task when dropped, so a cancelled playback cannot leave its fetch
 /// task behind.
-struct AbortOnDrop(JoinHandle<()>);
+pub struct AbortOnDrop<T>(pub JoinHandle<T>);
 
-impl Drop for AbortOnDrop {
+impl<T> Drop for AbortOnDrop<T> {
   fn drop(&mut self) { self.0.abort(); }
 }
 
@@ -27,13 +27,13 @@ impl Drop for AbortOnDrop {
 ///
 /// `ffplay` probes the bytes itself, so any container/codec it supports works
 /// (WebM/Opus, MP4/AAC, MP3, ...). `on_started` runs once the player process
-/// exists.
+/// exists, with its process ID.
 ///
 /// This future can be dropped at any time to stop playback: the `ffplay`
 /// process is killed with it, and so is the fetch task. Nothing in it can wait
 /// forever except the tail of the audio itself: network stalls and a wedged
 /// player both time out.
-pub async fn play_stream<S, E>(audio: S, on_started: impl FnOnce()) -> Result<(), String>
+pub async fn play_stream<S, E>(audio: S, on_started: impl FnOnce(Option<u32>)) -> Result<(), String>
 where
   S: Stream<Item = Result<Bytes, E>> + Send + 'static,
   E: std::fmt::Display + Send + 'static,
@@ -50,7 +50,7 @@ where
       _ => format!("could not start ffplay: {error}"),
     })?;
   let mut stdin = player.stdin.take().expect("ffplay stdin was piped");
-  on_started();
+  on_started(player.id());
 
   // The fetch task runs ahead of ffplay by a bounded amount; `send` waits once
   // the buffer is full, which is what applies backpressure to the download.
