@@ -33,6 +33,8 @@ pub struct Cache {
 impl Cache {
   pub fn new(dir: PathBuf) -> Self { Self { dir } }
 
+  pub fn dir(&self) -> &std::path::Path { &self.dir }
+
   /// `$XDG_CACHE_HOME/steak`, or `~/.cache/steak`.
   pub fn open() -> Self {
     let base = std::env::var_os("XDG_CACHE_HOME")

@@ -1,0 +1,144 @@
+//! The homepage: one column per shelf, each listing its tracks.
+
+use ratatui::{
+  Frame,
+  layout::{Constraint, Layout, Rect},
+  style::{Color, Style},
+  widgets::{Block, Paragraph},
+};
+use st_api::catalog::{Shelf, ShelfItem, Track};
+
+use super::{Hit, Target, ui};
+
+/// Columns are never narrower than this; extra shelves scroll sideways.
+const MIN_COLUMN_WIDTH: u16 = 36;
+/// Each track takes two rows: title, then artists.
+const ITEM_HEIGHT: u16 = 2;
+
+struct Column {
+  title:    String,
+  tracks:   Vec<Track>,
+  selected: usize,
+  offset:   usize,
+}
+
+#[derive(Default)]
+pub struct Home {
+  columns:     Vec<Column>,
+  col:         usize,
+  first:       usize,
+  pub loading: bool,
+  pub error:   Option<String>,
+}
+
+impl Home {
+  pub fn new() -> Self { Self { loading: true, ..Self::default() } }
+
+  /// Adds the shelves' tracks; shelves of albums and playlists have nothing to
+  /// play, so they are skipped.
+  pub fn add_shelves(&mut self, shelves: Vec<Shelf>) {
+    for shelf in shelves {
+      let tracks: Vec<Track> = shelf
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+          ShelfItem::Track(track) => Some(track),
+          ShelfItem::Card(_) => None,
+        })
+        .collect();
+      if !tracks.is_empty() {
+        self.columns.push(Column { title: shelf.title, tracks, selected: 0, offset: 0 });
+      }
+    }
+  }
+
+  pub fn selected_track(&self) -> Option<&Track> {
+    let column = self.columns.get(self.col)?;
+    column.tracks.get(column.selected)
+  }
+
+  pub fn track(&self, col: usize, idx: usize) -> Option<&Track> {
+    self.columns.get(col)?.tracks.get(idx)
+  }
+
+  pub fn select(&mut self, col: usize, idx: usize) {
+    if let Some(column) = self.columns.get_mut(col) {
+      self.col = col;
+      column.selected = idx.min(column.tracks.len().saturating_sub(1));
+    }
+  }
+
+  pub fn move_row(&mut self, delta: isize) { self.scroll(self.col, delta); }
+
+  /// Moves a column's selection, as the mouse wheel does.
+  pub fn scroll(&mut self, col: usize, delta: isize) {
+    if let Some(column) = self.columns.get_mut(col) {
+      column.selected =
+        column.selected.saturating_add_signed(delta).min(column.tracks.len().saturating_sub(1));
+    }
+  }
+
+  pub fn move_col(&mut self, delta: isize) {
+    if !self.columns.is_empty() {
+      self.col = self.col.saturating_add_signed(delta).min(self.columns.len() - 1);
+    }
+  }
+
+  pub fn render(
+    &mut self,
+    frame: &mut Frame,
+    area: Rect,
+    playing: Option<&str>,
+    hits: &mut Vec<Hit>,
+  ) {
+    if self.columns.is_empty() {
+      let text = match (&self.error, self.loading) {
+        (Some(error), _) => format!("Could not load the homepage: {error}"),
+        (None, true) => "Loading the homepage...".into(),
+        (None, false) => "The homepage has no tracks.".into(),
+      };
+      frame.render_widget(Paragraph::new(text).centered(), area);
+      return;
+    }
+
+    let visible = ((area.width / MIN_COLUMN_WIDTH) as usize).clamp(1, self.columns.len());
+    if self.col < self.first {
+      self.first = self.col;
+    } else if self.col >= self.first + visible {
+      self.first = self.col + 1 - visible;
+    }
+    self.first = self.first.min(self.columns.len() - visible);
+
+    let areas = Layout::horizontal(vec![Constraint::Ratio(1, visible as u32); visible]).split(area);
+    for (area, index) in areas.iter().zip(self.first..) {
+      let active = index == self.col;
+      let column = &mut self.columns[index];
+      let border = if active { Color::Cyan } else { Color::DarkGray };
+      let block = Block::bordered()
+        .title(format!(" {} ", column.title))
+        .border_style(Style::default().fg(border));
+      let inner = block.inner(*area);
+      frame.render_widget(block, *area);
+      hits.push(Hit { rect: *area, target: Target::HomeColumn(index) });
+
+      let rows = ((inner.height / ITEM_HEIGHT) as usize).max(1);
+      if column.selected < column.offset {
+        column.offset = column.selected;
+      } else if column.selected >= column.offset + rows {
+        column.offset = column.selected + 1 - rows;
+      }
+      for (slot, idx) in (column.offset..column.tracks.len()).take(rows).enumerate() {
+        let rect = Rect {
+          x:      inner.x,
+          y:      inner.y + slot as u16 * ITEM_HEIGHT,
+          width:  inner.width,
+          height: ITEM_HEIGHT.min(inner.height),
+        };
+        let track = &column.tracks[idx];
+        let is_playing = playing == Some(track.video_id.as_str());
+        ui::render_track(frame, rect, track, active && idx == column.selected, is_playing);
+        hits.push(Hit { rect, target: Target::HomeItem(index, idx) });
+      }
+    }
+  }
+}

@@ -1,4 +1,14 @@
-use std::{error::Error, process::Stdio, sync::Arc};
+mod tui;
+
+use std::{
+  error::Error,
+  pin::Pin,
+  process::Stdio,
+  sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+  },
+};
 
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
@@ -93,7 +103,14 @@ enum AuthSubcommand {
 /// A fetch task stays up to 64 chunks ahead of the playback task. The bounded
 /// queue both provides modest read-ahead and prevents an unlimited amount of
 /// audio from accumulating in memory. `ffplay` exits when the input ends.
-pub async fn play<S, E>(audio: S) -> Result<(), Box<dyn Error + Send + Sync>>
+///
+/// With `quiet`, ffplay's own output is discarded (it would corrupt a TUI), and
+/// its process ID is published to `pid` so the caller can pause it.
+pub async fn play<S, E>(
+  audio: S,
+  quiet: bool,
+  pid: &AtomicU32,
+) -> Result<(), Box<dyn Error + Send + Sync>>
 where
   S: Stream<Item = Result<Bytes, E>> + Send + 'static,
   E: Error + Send + Sync + 'static,
@@ -118,10 +135,17 @@ where
   });
 
   debug!("starting ffplay process");
-  let mut player = Command::new("ffplay")
+  let mut command = Command::new("ffplay");
+  command
     .args(["-nodisp", "-autoexit", "-loglevel", "error", "-i", "pipe:0"])
     .stdin(Stdio::piped())
-    .spawn()?;
+    // Dropping this future (to skip a track) must not leave ffplay running.
+    .kill_on_drop(true);
+  if quiet {
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+  }
+  let mut player = command.spawn()?;
+  pid.store(player.id().unwrap_or(0), Ordering::SeqCst);
   let mut stdin = player.stdin.take().expect("ffplay stdin was piped");
   let mut played_bytes = 0_u64;
 
@@ -144,6 +168,7 @@ where
 
   fetch_task.await?;
   let status = player.wait().await?;
+  pid.store(0, Ordering::SeqCst);
   debug!("ffplay exited with {status} after receiving {played_bytes} bytes");
   if !status.success() {
     return Err("ffplay exited unsuccessfully".into());
@@ -151,7 +176,7 @@ where
   Ok(())
 }
 
-fn setup_logging() -> Result<(), log::SetLoggerError> {
+fn setup_logging(to_file: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
   let level = std::env::var("RUST_LOG")
     .ok()
     .and_then(|value| value.parse().ok())
@@ -167,8 +192,16 @@ fn setup_logging() -> Result<(), log::SetLoggerError> {
         record.target()
       ))
     })
-    .chain(std::io::stderr())
-    .apply()
+    .chain(if to_file {
+      // The TUI owns the terminal, so logs go to a file instead.
+      let dir = Cache::open().dir().to_owned();
+      std::fs::create_dir_all(&dir)?;
+      fern::Output::from(fern::log_file(dir.join("steak.log"))?)
+    } else {
+      fern::Output::from(std::io::stderr())
+    })
+    .apply()?;
+  Ok(())
 }
 
 /// Resolves `video_id` to a signed audio URL.
@@ -271,10 +304,39 @@ enum Solve {
   Script(Arc<str>),
 }
 
+type AudioStream = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>;
+
+/// Resolves `video_id` and opens its audio as a byte stream.
+async fn open_audio(
+  http: &st_api::Client,
+  video_id: &str,
+) -> Result<AudioStream, Box<dyn Error + Send + Sync>> {
+  let cache = Cache::open();
+  let populated = cache.is_populated();
+  let stream_url = match resolve_stream(http, &cache, video_id).await {
+    Ok(url) => url,
+    // Something cached no longer works (YouTube rotated the player, say). Drop
+    // all of it and rebuild from scratch, once.
+    Err(error) if populated => {
+      warn!("cached state failed ({error}); clearing it and starting over");
+      cache.clear();
+      resolve_stream(http, &cache, video_id).await?
+    }
+    Err(error) => return Err(error),
+  };
+
+  // googlevideo refuses a stream past its first chunk unless it carries a
+  // valid PoToken. This is outside the cache fallback above on purpose: a
+  // PoToken failure says nothing about the cache.
+  let audio_client = AudioClient::new(http.clone());
+  let stream_url = authorize_stream(&audio_client, stream_url, video_id).await?;
+  Ok(audio_client.stream_chunked(AudioRequest::new(stream_url)).await?)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-  setup_logging()?;
   let cli = Cli::parse();
+  setup_logging(cli.command.is_none())?;
   let http = st_api::Client::new();
   match cli.command {
     Some(CliCommand::Auth(auth)) => {
@@ -295,29 +357,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     Some(CliCommand::Play { video_id }) => {
       info!("starting playback request for YouTube video {video_id}");
 
-      let cache = Cache::open();
-      let populated = cache.is_populated();
-      let stream_url = match resolve_stream(&http, &cache, &video_id).await {
-        Ok(url) => url,
-        // Something cached no longer works (YouTube rotated the player, say). Drop
-        // all of it and rebuild from scratch, once.
-        Err(error) if populated => {
-          warn!("cached state failed ({error}); clearing it and starting over");
-          cache.clear();
-          resolve_stream(&http, &cache, &video_id).await?
-        }
-        Err(error) => return Err(error),
-      };
-
-      // googlevideo refuses a stream past its first chunk unless it carries a
-      // valid PoToken. This is outside the cache fallback above on purpose: a
-      // PoToken failure says nothing about the cache.
-      let audio_client = AudioClient::new(http.clone());
-      let stream_url = authorize_stream(&audio_client, stream_url, &video_id).await?;
-      let audio = audio_client.stream_chunked(AudioRequest::new(stream_url)).await?;
-      play(audio).await?;
+      let audio = open_audio(&http, &video_id).await?;
+      play(audio, false, &AtomicU32::new(0)).await?;
     }
-    None => {}
+    None => return tui::run(http).await,
   }
 
   Ok(())
@@ -336,7 +379,7 @@ fn auth_command(
 
 /// Builds an authenticated Music client from the cached (or fresh) web app
 /// configuration and the stored session.
-async fn music_client(
+pub async fn music_client(
   http: &st_api::Client,
   cache: &Cache,
 ) -> Result<MusicClient, Box<dyn Error + Send + Sync>> {
