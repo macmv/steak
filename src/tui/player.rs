@@ -16,7 +16,7 @@ use ratatui::{
   style::{Color, Style},
   widgets::Paragraph,
 };
-use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
+use ratatui_image::{Resize, StatefulImage, protocol::StatefulProtocol};
 use st_proto::{
   catalog::{Thumbnail, Track},
   ipc::{Command, PlayerView, Request, Source, Transport},
@@ -251,7 +251,10 @@ impl Player {
     let inner = ui::render_section(frame, left, album.as_deref().unwrap_or("Album art"), false);
     match &mut self.art {
       Some((_, protocol)) => {
-        frame.render_stateful_widget(StatefulImage::default(), inner, protocol)
+        // `Scale`, not the default `Fit`: `Fit` never enlarges an image past
+        // its own pixel size, so the art could not grow with the window.
+        let image = StatefulImage::default().resize(Resize::Scale(None));
+        frame.render_stateful_widget(image, centered_square(inner), protocol)
       }
       None => frame.render_widget(
         Paragraph::new("No album art").style(Style::default().fg(Color::DarkGray)).centered(),
@@ -296,6 +299,20 @@ impl Player {
       ui::render_track(frame, text, &track, idx == self.cursor, idx == self.view.index);
       hits.push(Hit { rect, target: Target::Queue(Some(idx)) });
     }
+  }
+}
+
+/// The biggest square that is 80% of `area`'s width (or less, if it would not
+/// fit the height), centered in it. Cells are about twice as tall as they are
+/// wide, so a square is twice as many columns as rows.
+fn centered_square(area: Rect) -> Rect {
+  let width = (area.width * 4 / 5).min(area.height.saturating_mul(2));
+  let height = width / 2;
+  Rect {
+    x: area.x + (area.width - width) / 2,
+    y: area.y + (area.height - height) / 2,
+    width,
+    height,
   }
 }
 
