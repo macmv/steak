@@ -14,7 +14,7 @@ use st_api::{
   },
   media::audio::{AudioClient, AudioRequest},
   playback::{
-    access::po_token::{BotguardCliProvider, authorize_stream},
+    access::po_token::authorize_stream,
     player_script::{
       EjsCipherResolver, player_cache_key, resolve_and_preprocess, resolve_with_solver,
       signature_timestamp,
@@ -290,11 +290,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
       // valid PoToken. This is outside the cache fallback above on purpose: a
       // PoToken failure says nothing about the cache.
       let audio_client = AudioClient::new(http.clone());
-      let botguard = match std::env::var_os("STEAK_BOTGUARD") {
-        Some(binary) => BotguardCliProvider::new(binary),
-        None => BotguardCliProvider::default(),
-      };
-      let stream_url = authorize_stream(&botguard, &audio_client, stream_url, &video_id).await?;
+      let stream_url = authorize_stream(&audio_client, stream_url, &video_id).await?;
       let audio = audio_client.stream_chunked(AudioRequest::new(stream_url)).await?;
       play(audio).await?;
     }

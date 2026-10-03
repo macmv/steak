@@ -45,20 +45,19 @@ impl<O> PoTokenProvider<O> for UnsupportedPoTokenProvider {
 ///
 /// Streams are authorized with a token bound to the video ID: without it only
 /// the first range of a stream is served and later ranges get a 403.
-#[derive(Clone, Debug)]
-pub struct BotguardCliProvider {
-  binary: std::path::PathBuf,
-}
+///
+/// This is an implementation detail of `authorize_stream`, kept private so the
+/// CLI can be swapped out for an in-process solver.
+#[derive(Clone, Copy, Debug)]
+struct BotguardCli;
 
-impl BotguardCliProvider {
-  pub const DEFAULT_BINARY: &'static str = "rustypipe-botguard";
-
-  pub fn new(binary: impl Into<std::path::PathBuf>) -> Self { Self { binary: binary.into() } }
+impl BotguardCli {
+  const BINARY: &'static str = "rustypipe-botguard";
 
   /// Mints a token bound to `identifier` (a video ID). Blocking: it spawns a
   /// process and waits for it, so call it from `spawn_blocking` in async code.
-  pub fn mint(&self, identifier: &str) -> Result<String, PoTokenError> {
-    let output = std::process::Command::new(&self.binary)
+  fn mint(&self, identifier: &str) -> Result<String, PoTokenError> {
+    let output = std::process::Command::new(Self::BINARY)
       // Never use the snapshot: it freezes one BotGuard session, and roughly a
       // quarter of sessions mint tokens that googlevideo rejects, so a bad
       // snapshot would fail every time until it expires.
@@ -68,17 +67,17 @@ impl BotguardCliProvider {
       .output()
       .map_err(|error| {
         let hint = if error.kind() == std::io::ErrorKind::NotFound {
-          " (install it with `cargo install rustypipe-botguard`, or set STEAK_BOTGUARD)".to_owned()
+          " (install it with `cargo install rustypipe-botguard`)".to_owned()
         } else {
           String::new()
         };
-        PoTokenError::FetchFailed(format!("could not run {}: {error}{hint}", self.binary.display()))
+        PoTokenError::FetchFailed(format!("could not run {}: {error}{hint}", Self::BINARY))
       })?;
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
       return Err(PoTokenError::FetchFailed(format!(
         "{} exited with {}: {}",
-        self.binary.display(),
+        Self::BINARY,
         output.status,
         stderr.trim()
       )));
@@ -90,10 +89,6 @@ impl BotguardCliProvider {
       .map(str::to_owned)
       .ok_or_else(|| PoTokenError::FetchFailed("botguard printed no token".into()))
   }
-}
-
-impl Default for BotguardCliProvider {
-  fn default() -> Self { Self::new(Self::DEFAULT_BINARY) }
 }
 
 /// How many fresh BotGuard sessions to try before giving up.
@@ -142,7 +137,6 @@ async fn is_authorized(audio: &AudioClient, url: &reqwest::Url) -> Result<bool, 
 /// there is no way to tell from the token itself, so each token is checked
 /// against the server and replaced with one from a new session if refused.
 pub async fn authorize_stream(
-  provider: &BotguardCliProvider,
   audio: &AudioClient,
   mut url: reqwest::Url,
   video_id: &str,
@@ -153,8 +147,8 @@ pub async fn authorize_stream(
   }
   let mut last_error = None;
   for attempt in 1..=MAX_ATTEMPTS {
-    let (minter, id) = (provider.clone(), video_id.to_owned());
-    let token = tokio::task::spawn_blocking(move || minter.mint(&id))
+    let id = video_id.to_owned();
+    let token = tokio::task::spawn_blocking(move || BotguardCli.mint(&id))
       .await
       .map_err(|error| PoTokenError::FetchFailed(error.to_string()))?;
     match token {
