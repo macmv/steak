@@ -1,4 +1,14 @@
-use std::{error::Error, process::Stdio, sync::Arc};
+mod tui;
+
+use std::{
+  error::Error,
+  pin::Pin,
+  process::Stdio,
+  sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+  },
+};
 
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
@@ -101,7 +111,14 @@ enum AuthSubcommand {
 /// A fetch task stays up to 64 chunks ahead of the playback task. The bounded
 /// queue both provides modest read-ahead and prevents an unlimited amount of
 /// audio from accumulating in memory. `ffplay` exits when the input ends.
-pub async fn play<S, E>(audio: S) -> Result<(), Box<dyn Error + Send + Sync>>
+///
+/// With `quiet`, ffplay's own output is discarded (it would corrupt a TUI), and
+/// its process ID is published to `pid` so the caller can pause it.
+pub async fn play<S, E>(
+  audio: S,
+  quiet: bool,
+  pid: &AtomicU32,
+) -> Result<(), Box<dyn Error + Send + Sync>>
 where
   S: Stream<Item = Result<Bytes, E>> + Send + 'static,
   E: Error + Send + Sync + 'static,
@@ -117,6 +134,8 @@ where
       "pipe:0".as_ref(),
     ],
     audio,
+    quiet,
+    pid,
   )
   .await
 }
@@ -149,7 +168,7 @@ where
   ];
   let mut all = args.to_vec();
   all.push(output.as_os_str());
-  pipe_to_ffmpeg("ffmpeg", &all, audio).await
+  pipe_to_ffmpeg("ffmpeg", &all, audio, false, &AtomicU32::new(0)).await
 }
 
 /// Feeds `audio` to the stdin of `program` (an FFmpeg tool) and waits for it
@@ -158,6 +177,8 @@ async fn pipe_to_ffmpeg<S, E>(
   program: &str,
   args: &[&std::ffi::OsStr],
   audio: S,
+  quiet: bool,
+  pid: &AtomicU32,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
 where
   S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -183,7 +204,17 @@ where
   });
 
   debug!("starting {program} process");
-  let mut player = Command::new(program).args(args).stdin(Stdio::piped()).spawn()?;
+  let mut command = Command::new(program);
+  command
+    .args(args)
+    .stdin(Stdio::piped())
+    // Dropping this future (to skip a track) must not leave the process running.
+    .kill_on_drop(true);
+  if quiet {
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+  }
+  let mut player = command.spawn()?;
+  pid.store(player.id().unwrap_or(0), Ordering::SeqCst);
   let mut stdin = player.stdin.take().expect("stdin was piped");
   let mut played_bytes = 0_u64;
 
@@ -206,6 +237,7 @@ where
 
   fetch_task.await?;
   let status = player.wait().await?;
+  pid.store(0, Ordering::SeqCst);
   debug!("{program} exited with {status} after receiving {played_bytes} bytes");
   if !status.success() {
     return Err(format!("{program} exited unsuccessfully").into());
@@ -213,7 +245,7 @@ where
   Ok(())
 }
 
-fn setup_logging() -> Result<(), log::SetLoggerError> {
+fn setup_logging(to_file: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
   let level = std::env::var("RUST_LOG")
     .ok()
     .and_then(|value| value.parse().ok())
@@ -229,8 +261,16 @@ fn setup_logging() -> Result<(), log::SetLoggerError> {
         record.target()
       ))
     })
-    .chain(std::io::stderr())
-    .apply()
+    .chain(if to_file {
+      // The TUI owns the terminal, so logs go to a file instead.
+      let dir = Cache::open().dir().to_owned();
+      std::fs::create_dir_all(&dir)?;
+      fern::Output::from(fern::log_file(dir.join("steak.log"))?)
+    } else {
+      fern::Output::from(std::io::stderr())
+    })
+    .apply()?;
+  Ok(())
 }
 
 /// Resolves `video_id` to a signed audio URL.
@@ -360,10 +400,21 @@ async fn authorized_stream(
   Ok((audio_client, stream_url))
 }
 
+type AudioStream = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>;
+
+/// Resolves `video_id` and opens its audio as a byte stream.
+async fn open_audio(
+  http: &st_api::Client,
+  video_id: &str,
+) -> Result<AudioStream, Box<dyn Error + Send + Sync>> {
+  let (audio_client, stream_url) = authorized_stream(http, video_id).await?;
+  Ok(audio_client.stream_chunked(AudioRequest::new(stream_url)).await?)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-  setup_logging()?;
   let cli = Cli::parse();
+  setup_logging(cli.command.is_none())?;
   let http = st_api::Client::new();
   match cli.command {
     Some(CliCommand::Auth(auth)) => {
@@ -385,7 +436,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
       info!("starting playback request for YouTube video {video_id}");
       let (audio_client, stream_url) = authorized_stream(&http, &video_id).await?;
       let audio = audio_client.stream_chunked(AudioRequest::new(stream_url)).await?;
-      play(audio).await?;
+      play(audio, false, &AtomicU32::new(0)).await?;
     }
     Some(CliCommand::Download { video_id, output }) => {
       info!("starting download request for YouTube video {video_id}");
@@ -395,7 +446,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
       download(audio, &output).await?;
       info!("saved {}", output.display());
     }
-    None => {}
+    None => return tui::run(http).await,
   }
 
   Ok(())
@@ -414,7 +465,7 @@ fn auth_command(
 
 /// Builds an authenticated Music client from the cached (or fresh) web app
 /// configuration and the stored session.
-async fn music_client(
+pub async fn music_client(
   http: &st_api::Client,
   cache: &Cache,
 ) -> Result<MusicClient, Box<dyn Error + Send + Sync>> {

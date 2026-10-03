@@ -15,7 +15,15 @@ fern = "0.7.1"
 futures-util = "0.3"
 log = "0.4.33"
 st-api = { path = "st-api" }
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+# chafa (the default) needs a system library; the built-in encoders cover
+# kitty, sixel, iterm2 and halfblocks.
+ratatui-image = { version = "12.0.0-rc.0", default-features = false, features = ["crossterm", "image-defaults"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+libc = "0.2"
 
 # The EJS challenge solver runs a full JS parser over the 2.6 MB player inside
 # QuickJS; at -O0 that takes ~15s. Only the C engine needs optimizing in dev
