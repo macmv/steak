@@ -6,7 +6,7 @@ use ratatui::{
   style::{Color, Style},
   widgets::{Block, Paragraph},
 };
-use st_api::catalog::{Artist, Card, Shelf, ShelfItem, Track};
+use st_proto::catalog::{Artist, Card, Shelf, ShelfItem, Track};
 
 use super::{Hit, Target, ui};
 

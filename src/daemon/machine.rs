@@ -136,8 +136,10 @@ impl State {
 
   pub fn rev(&self) -> u64 { self.rev }
 
+  #[cfg(test)]
   pub fn transport(&self) -> &Transport { &self.transport }
 
+  #[cfg(test)]
   pub fn generation(&self) -> u64 { self.generation }
 
   /// Forgets everything but the revision, which only ever goes up. For

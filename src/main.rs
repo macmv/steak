@@ -6,6 +6,7 @@
 
 mod client;
 mod daemon;
+mod tui;
 
 use std::{error::Error, path::PathBuf};
 
@@ -20,8 +21,9 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 #[derive(Debug, Parser)]
 #[command(about = "A YouTube Music player. Needs the `steak daemon` running.")]
 struct Cli {
+  /// Without a subcommand, opens the terminal UI.
   #[command(subcommand)]
-  command: CliCommand,
+  command: Option<CliCommand>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -158,11 +160,18 @@ async fn run() -> Result<()> {
   let cli = Cli::parse();
   let run_daemon = matches!(
     &cli.command,
-    CliCommand::Daemon(DaemonCommand { command: None | Some(DaemonSubcommand::Run) })
+    Some(CliCommand::Daemon(DaemonCommand { command: None | Some(DaemonSubcommand::Run) }))
   );
-  setup_logging(if run_daemon { log::LevelFilter::Info } else { log::LevelFilter::Warn })?;
+  // Anything logged to stderr would be drawn over the TUI.
+  let level = match (&cli.command, run_daemon) {
+    (_, true) => log::LevelFilter::Info,
+    (None, _) => log::LevelFilter::Off,
+    _ => log::LevelFilter::Warn,
+  };
+  setup_logging(level)?;
 
-  match cli.command {
+  let Some(command) = cli.command else { return tui::run().await };
+  match command {
     CliCommand::Daemon(DaemonCommand { command }) => match command {
       None | Some(DaemonSubcommand::Run) => daemon::run().await,
       Some(DaemonSubcommand::Install) => daemon::service::install().map_err(Into::into),
