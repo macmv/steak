@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::StreamExt;
-use log::debug;
+use log::{debug, warn};
 use reqwest::{Client, Response, StatusCode, Url, header};
 use std::pin::Pin;
 
@@ -123,30 +123,84 @@ impl AudioClient {
     };
 
     let client = self.clone();
-    // State is the next offset to fetch; `None` once finished or failed.
-    let chunks = futures_util::stream::unfold(Some(0_u64), move |offset| {
+    let state = ChunkState { offset: 0, body: None, retries: 0 };
+    let stream = futures_util::stream::unfold(state, move |mut state| {
       let client = client.clone();
       let request = request.clone();
       async move {
-        let start = offset.filter(|start| *start < total)?;
-        let end = (start + CHUNK_SIZE).min(total) - 1;
-        let mut request = request;
-        request.byte_range = Some(start..=end);
-        let response = client
-          .request(request)
-          .await
-          .and_then(|response| response.error_for_status().map_err(|error| error.without_url()));
-        match response {
-          Ok(response) => Some((Ok(response.bytes_stream()), Some(end + 1))),
-          Err(error) => Some((Err(error), None)),
+        loop {
+          if let Some(body) = state.body.as_mut() {
+            match body.next().await {
+              Some(Ok(bytes)) => {
+                state.offset += bytes.len() as u64;
+                state.retries = 0;
+                return Some((Ok(bytes), state));
+              }
+              Some(Err(error)) => {
+                state.body = None;
+                if !state.should_retry(&error) {
+                  state.offset = total;
+                  return Some((Err(error.without_url()), state));
+                }
+                warn!("audio body failed at byte {} ({error}); resuming", state.offset);
+                backoff(state.retries).await;
+              }
+              // Chunk finished; the next iteration requests the following one.
+              None => state.body = None,
+            }
+            continue;
+          }
+
+          if state.offset >= total {
+            return None;
+          }
+          let end = (state.offset + CHUNK_SIZE).min(total) - 1;
+          let mut request = request.clone();
+          request.byte_range = Some(state.offset..=end);
+          let response = client
+            .request(request)
+            .await
+            .and_then(|response| response.error_for_status().map_err(|e| e.without_url()));
+          match response {
+            Ok(response) => state.body = Some(response.bytes_stream().boxed()),
+            Err(error) if state.should_retry(&error) => {
+              warn!("audio request failed at byte {} ({error}); retrying", state.offset);
+              backoff(state.retries).await;
+            }
+            Err(error) => {
+              state.offset = total;
+              return Some((Err(error), state));
+            }
+          }
         }
       }
     });
-    Ok(Box::pin(chunks.flat_map(|chunk| match chunk {
-      Ok(body) => body.left_stream(),
-      Err(error) => futures_util::stream::once(std::future::ready(Err(error))).right_stream(),
-    })))
+    Ok(Box::pin(stream))
   }
+}
+
+/// Maximum consecutive failures tolerated before giving up on a stream.
+const MAX_RETRIES: u32 = 5;
+
+struct ChunkState {
+  /// Next byte to deliver; resuming after a failure restarts here.
+  offset:  u64,
+  body:    Option<Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>>,
+  /// Consecutive failures since the last byte was received.
+  retries: u32,
+}
+
+impl ChunkState {
+  /// Records a failure and returns whether it is worth retrying. HTTP error
+  /// statuses (a rejected URL) are final; network and decoding errors are not.
+  fn should_retry(&mut self, error: &reqwest::Error) -> bool {
+    self.retries += 1;
+    error.status().is_none() && self.retries <= MAX_RETRIES
+  }
+}
+
+async fn backoff(retries: u32) {
+  tokio::time::sleep(std::time::Duration::from_millis(250 * u64::from(retries))).await;
 }
 
 /// Returns whether `status` denotes a successful full or byte-range audio
