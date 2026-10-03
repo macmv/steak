@@ -2,10 +2,11 @@
 //! objects.
 
 use crate::innertube::client::WatchEndpoint;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// A track returned by YouTube Music search.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Track {
   pub video_id:   String,
   pub title:      String,
@@ -16,19 +17,19 @@ pub struct Track {
   pub watch:      Option<WatchEndpoint>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Artist {
   pub id:   Option<String>,
   pub name: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Album {
   pub id:   Option<String>,
   pub name: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Thumbnail {
   pub url:    String,
   pub width:  Option<u32>,
@@ -48,13 +49,13 @@ impl SearchParser {
 }
 
 /// A row of the Music homepage, such as "Quick picks" or "Listen again".
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Shelf {
   pub title: String,
   pub items: Vec<ShelfItem>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ShelfItem {
   Track(Track),
   Card(Card),
@@ -62,7 +63,7 @@ pub enum ShelfItem {
 
 /// A shelf entry that is not a plain track row: an album, playlist, artist,
 /// or a video/radio card.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Card {
   pub title:     String,
   pub subtitle:  String,

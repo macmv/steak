@@ -14,7 +14,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 sha1 = "0.10"
 log = "0.4.33"
 rquickjs = "0.14.0"
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio = { version = "1", features = ["process", "rt", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

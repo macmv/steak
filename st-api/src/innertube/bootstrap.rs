@@ -107,17 +107,14 @@ impl WebBootstrapper {
     Self { http, user_agent }
   }
 
-  /// Fetches a watch page when the player response does not carry its script
-  /// URL.
-  pub async fn player_script_url(
-    &self,
-    video_id: &str,
-  ) -> Result<Option<reqwest::Url>, BootstrapError> {
-    debug!("fetching YouTube Music watch page for player JavaScript (video {video_id})");
+  /// Fetches a watch page when the landing page does not carry the player
+  /// script URL. The player script is the same for every video, so no video ID
+  /// is needed.
+  pub async fn player_script_url(&self) -> Result<Option<reqwest::Url>, BootstrapError> {
+    debug!("fetching YouTube Music watch page for player JavaScript");
     let response = self
       .http
       .get("https://music.youtube.com/watch")
-      .query(&[("v", video_id)])
       .header(header::USER_AGENT, &self.user_agent)
       .send()
       .await

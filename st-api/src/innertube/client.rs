@@ -6,10 +6,14 @@
 
 use log::debug;
 use reqwest::{Client, Url, header};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 const BASE_URL: &str = "https://music.youtube.com/youtubei/v1/";
+
+/// How long one Innertube call may take, from sending it to reading the whole
+/// response.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The Innertube endpoint to invoke.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,7 +28,7 @@ pub enum Endpoint {
 }
 
 /// Navigation state carried by a search or queue item's watch endpoint.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WatchEndpoint {
   pub video_id:              String,
   pub playlist_id:           Option<String>,
@@ -165,6 +169,7 @@ impl MusicClient {
       .header(header::ORIGIN, "https://music.youtube.com")
       .header(header::REFERER, "https://music.youtube.com/")
       .headers(self.config.headers.clone())
+      .timeout(REQUEST_TIMEOUT)
       .json(&payload);
     if let Some(visitor_data) = &self.config.context.visitor_data {
       request = request.header("X-Goog-Visitor-Id", visitor_data);

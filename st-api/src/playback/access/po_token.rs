@@ -54,17 +54,29 @@ struct BotguardCli;
 impl BotguardCli {
   const BINARY: &'static str = "rustypipe-botguard";
 
-  /// Mints a token bound to `identifier` (a video ID). Blocking: it spawns a
-  /// process and waits for it, so call it from `spawn_blocking` in async code.
-  fn mint(&self, identifier: &str) -> Result<String, PoTokenError> {
-    let output = std::process::Command::new(Self::BINARY)
+  /// Mints a token bound to `identifier` (a video ID).
+  ///
+  /// The child is killed if it outlives `MINT_TIMEOUT` or if this future is
+  /// dropped, so a wedged BotGuard run can never wedge a caller.
+  async fn mint(&self, identifier: &str) -> Result<String, PoTokenError> {
+    let mut command = tokio::process::Command::new(Self::BINARY);
+    command
       // Never use the snapshot: it freezes one BotGuard session, and roughly a
       // quarter of sessions mint tokens that googlevideo rejects, so a bad
       // snapshot would fail every time until it expires.
       .arg("--no-snapshot")
       // Video IDs may start with `-`, so separate them from the options.
       .args(["--", identifier])
-      .output()
+      .kill_on_drop(true);
+    let output = tokio::time::timeout(MINT_TIMEOUT, command.output())
+      .await
+      .map_err(|_| {
+        PoTokenError::FetchFailed(format!(
+          "{} did not finish within {}s",
+          Self::BINARY,
+          MINT_TIMEOUT.as_secs()
+        ))
+      })?
       .map_err(|error| {
         let hint = if error.kind() == std::io::ErrorKind::NotFound {
           " (install it with `cargo install rustypipe-botguard`)".to_owned()
@@ -91,6 +103,8 @@ impl BotguardCli {
   }
 }
 
+/// How long one BotGuard run may take. A healthy run takes a few seconds.
+const MINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 /// How many fresh BotGuard sessions to try before giving up.
 ///
 /// Roughly 40-50% of sessions mint tokens googlevideo rejects. The reason is
@@ -147,11 +161,7 @@ pub async fn authorize_stream(
   }
   let mut last_error = None;
   for attempt in 1..=MAX_ATTEMPTS {
-    let id = video_id.to_owned();
-    let token = tokio::task::spawn_blocking(move || BotguardCli.mint(&id))
-      .await
-      .map_err(|error| PoTokenError::FetchFailed(error.to_string()))?;
-    match token {
+    match BotguardCli.mint(video_id).await {
       Ok(token) => {
         apply_po_token(&mut url, &token);
         if is_authorized(audio, &url).await? {
