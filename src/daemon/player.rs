@@ -31,6 +31,7 @@ use super::{
   Daemon,
   audio::AbortOnDrop,
   machine::{Effect, Event, Input, State, reduce},
+  stats,
 };
 
 /// A queue fetch (a radio batch, a playlist page) may take this long.
@@ -172,6 +173,7 @@ impl Actor {
     self.stop_audio();
     let pid = Arc::new(AtomicU32::new(0));
     let (daemon, events) = (self.daemon.clone(), self.events.clone());
+    let view = self.published.subscribe();
     let job_pid = pid.clone();
     let task = tokio::spawn(async move {
       info!("playing {video_id}");
@@ -181,9 +183,15 @@ impl Actor {
       let mut job = AbortOnDrop(tokio::spawn({
         let (events, pid) = (events.clone(), job_pid.clone());
         async move {
+          let weak = daemon.clone();
           let daemon = daemon.upgrade().ok_or("the daemon is shutting down")?;
           let backend = daemon.backend();
-          let audio = backend.open_audio(&video_id).await.map_err(|error| error.to_string())?;
+          let opened = backend.open_audio(&video_id).await.map_err(|error| error.to_string())?;
+          if let Some(tracking) = opened.tracking {
+            // Detached: it outlives this job to send the final ping.
+            tokio::spawn(stats::track(weak.clone(), tracking, video_id.clone(), view.clone()));
+          }
+          let audio = opened.chunks;
           let on_started = Box::new(move |child: Option<u32>| {
             pid.store(child.unwrap_or(0), Ordering::SeqCst);
             let _ = events.send(Input::Event(Event::AudioStarted { generation }));

@@ -14,8 +14,8 @@ use std::{
   future::Future,
   path::{Path, PathBuf},
   pin::Pin,
-  sync::Arc,
-  time::Duration,
+  sync::{Arc, Mutex},
+  time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -24,11 +24,13 @@ use log::{info, warn};
 use st_api::{
   Url,
   catalog::{HomeParser, PlaylistParser, QueueParser},
+  innertube::bootstrap::WebBootstrapper,
   media::audio::{AudioClient, AudioRequest},
   playback::{
     access::po_token::authorize_stream,
     player_script::{player_cache_key, resolve_with_solver},
     response::{AudioQuality, PlayerParser, StandardPlayerParser},
+    stats::{Ping, PlaybackTracking, with_cpn},
   },
 };
 
@@ -74,7 +76,12 @@ pub trait Backend: Send + Sync + 'static {
     token: Option<String>,
   ) -> Fut<'a, Result<Batch, BoxError>>;
   /// Opens the audio of `video_id` as a stream of chunks.
-  fn open_audio<'a>(&'a self, video_id: &'a str) -> Fut<'a, Result<AudioChunks, BoxError>>;
+  fn open_audio<'a>(&'a self, video_id: &'a str) -> Fut<'a, Result<Opened, BoxError>>;
+  /// Tells YouTube about a playback's progress (see `stats.rs`). Nothing to do
+  /// by default.
+  fn report<'a>(&'a self, _: &'a PlaybackTracking, _: Ping) -> Fut<'a, Result<(), BoxError>> {
+    Box::pin(async { Ok(()) })
+  }
   /// The bytes of an image (album art).
   fn art<'a>(&'a self, url: &'a str) -> Fut<'a, Result<Vec<u8>, BoxError>>;
 
@@ -97,17 +104,35 @@ pub trait Backend: Send + Sync + 'static {
 /// The audio of one track, as it downloads.
 pub type AudioChunks = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>;
 
+/// An opened track: its audio, and what is needed to report it as played.
+pub struct Opened {
+  pub chunks:   AudioChunks,
+  /// `None` when YouTube gave no tracking URLs, or for a fake.
+  pub tracking: Option<PlaybackTracking>,
+}
+
 /// Each stage of getting audio is bounded, so playback can be slow to start
 /// but never hang.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(150);
 const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(150);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+/// The signed-in page's token is reused this long before it is fetched again.
+const SESSION_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// The real backend: YouTube Music, `ffplay` and `ffmpeg`.
 pub struct YouTube {
   pub caches:  Arc<Caches>,
   pub session: Arc<Session>,
   art:         ArtCache,
+  /// The signed-in page's `XSRF_TOKEN`, for the session generation it was
+  /// fetched with.
+  token:       Mutex<Option<SessionToken>>,
+}
+
+struct SessionToken {
+  generation: u64,
+  fetched:    Instant,
+  value:      String,
 }
 
 impl YouTube {
@@ -121,7 +146,7 @@ impl YouTube {
       })
     };
     let session = Session::new(super::config::Config::load(), verifier);
-    Self { caches, session, art: ArtCache::default() }
+    Self { caches, session, art: ArtCache::default(), token: Mutex::new(None) }
   }
 }
 
@@ -150,8 +175,16 @@ impl Backend for YouTube {
     Box::pin(self.fetch_queue(source, token))
   }
 
-  fn open_audio<'a>(&'a self, video_id: &'a str) -> Fut<'a, Result<AudioChunks, BoxError>> {
+  fn open_audio<'a>(&'a self, video_id: &'a str) -> Fut<'a, Result<Opened, BoxError>> {
     Box::pin(self.fetch_audio(video_id))
+  }
+
+  fn report<'a>(
+    &'a self,
+    tracking: &'a PlaybackTracking,
+    ping: Ping,
+  ) -> Fut<'a, Result<(), BoxError>> {
+    Box::pin(self.send_ping(tracking, ping))
   }
 
   fn art<'a>(&'a self, url: &'a str) -> Fut<'a, Result<Vec<u8>, BoxError>> {
@@ -295,9 +328,15 @@ impl YouTube {
 
   /// Resolves `video_id` to a signed URL that googlevideo serves in full, and
   /// opens it as a stream of chunks.
-  async fn fetch_audio(&self, video_id: &str) -> Result<AudioChunks, BoxError> {
-    let url =
+  async fn fetch_audio(&self, video_id: &str) -> Result<Opened, BoxError> {
+    let (url, tracking) =
       timeout(RESOLVE_TIMEOUT, "resolving the stream", self.resolve_stream(video_id)).await??;
+    // The web player tells googlevideo which playback a stream belongs to; the
+    // stats pings carry the same `cpn`.
+    let url = match &tracking {
+      Some(tracking) => with_cpn(url, &tracking.cpn),
+      None => url,
+    };
     // googlevideo refuses a stream past its first chunk unless it carries a
     // valid PoToken. This is outside the cache-rebuild logic on purpose: a
     // PoToken failure says nothing about the caches.
@@ -310,7 +349,38 @@ impl YouTube {
       audio.stream_chunked(AudioRequest::new(url)).await.map_err(|e| BoxError::from(e.to_string()))
     })
     .await??;
-    Ok(Box::pin(stream.map(|chunk| chunk.map_err(|error| error.to_string()))))
+    let chunks = Box::pin(stream.map(|chunk| chunk.map_err(|error| error.to_string())));
+    Ok(Opened { chunks, tracking })
+  }
+
+  /// Sends one stats ping as the signed-in account.
+  async fn send_ping(&self, tracking: &PlaybackTracking, ping: Ping) -> Result<(), BoxError> {
+    let (client, lease) = self.client().await?;
+    let token = self.session_token(&lease).await?;
+    let url = tracking.url(&ping, &client.stats_params());
+    client.send_stats(url, &token).await.map_err(|error| error.without_url())?;
+    Ok(())
+  }
+
+  /// The signed-in page's `XSRF_TOKEN`, fetched once per session and hour.
+  async fn session_token(&self, lease: &super::session::SessionLease) -> Result<String, BoxError> {
+    {
+      let cached = self.token.lock().unwrap();
+      if let Some(token) = cached.as_ref() {
+        if token.generation == lease.generation && token.fetched.elapsed() < SESSION_TOKEN_TTL {
+          return Ok(token.value.clone());
+        }
+      }
+    }
+    let value = WebBootstrapper::new(self.caches.http.clone())
+      .session_token(lease.session.auth_session().request_headers())
+      .await?;
+    *self.token.lock().unwrap() = Some(SessionToken {
+      generation: lease.generation,
+      fetched:    Instant::now(),
+      value:      value.clone(),
+    });
+    Ok(value)
   }
 
   /// Resolves `video_id` to a signed audio URL.
@@ -318,20 +388,26 @@ impl YouTube {
   /// If a cached piece turns out not to fit (YouTube moved to a new player, or
   /// the solver died), that piece is invalidated and the whole thing is tried
   /// once more with a rebuilt one. A second failure is reported as is.
-  async fn resolve_stream(&self, video_id: &str) -> Result<Url, BoxError> {
+  async fn resolve_stream(
+    &self,
+    video_id: &str,
+  ) -> Result<(Url, Option<PlaybackTracking>), BoxError> {
     match self.try_resolve(video_id).await? {
-      Ok(url) => return Ok(url),
+      Ok(resolved) => return Ok(resolved),
       Err(stale) => warn!("{stale}; rebuilt the affected cache, trying once more"),
     }
     match self.try_resolve(video_id).await? {
-      Ok(url) => Ok(url),
+      Ok(resolved) => Ok(resolved),
       Err(stale) => Err(stale.into()),
     }
   }
 
   /// One attempt. The outer error is final; the inner one means a cache was
   /// stale (and has been invalidated), so a retry is worthwhile.
-  async fn try_resolve(&self, video_id: &str) -> Result<Result<Url, String>, BoxError> {
+  async fn try_resolve(
+    &self,
+    video_id: &str,
+  ) -> Result<Result<(Url, Option<PlaybackTracking>), String>, BoxError> {
     let bootstrap = self.caches.bootstrap.get().await?;
     let player = self.caches.player_for(&bootstrap).await?;
     let (client, _) = self.client().await?;
@@ -356,7 +432,13 @@ impl YouTube {
     match resolve_with_solver(&format.stream_url, &player.solver).await {
       Ok(url) => {
         info!("resolved {video_id}: {} at {} bps", format.mime_type, format.bitrate);
-        Ok(Ok(url))
+        let tracking = PlaybackTracking::from_player(&response, format.itag);
+        if tracking.is_none() {
+          warn!(
+            "the player response for {video_id} has no tracking URLs; this play will not be reported"
+          );
+        }
+        Ok(Ok((url, tracking)))
       }
       Err(error) => {
         self.caches.player.invalidate(player.generation);

@@ -40,6 +40,13 @@ impl BootstrapData {
       .and_then(|client| client.as_object().cloned())
       .unwrap_or_default();
     config.request_context = request_context;
+    config.page_client = self
+      .request_context
+      .get("INNERTUBE_CONTEXT")
+      .and_then(|context| context.get("client"))
+      .and_then(Value::as_object)
+      .cloned()
+      .unwrap_or_default();
     if let Some(cookies) = &self.cookies {
       if let Ok(value) = cookies.parse() {
         config.headers.insert(header::COOKIE, value);
@@ -134,6 +141,35 @@ impl WebBootstrapper {
       warn!("watch-page ytcfg has no usable PLAYER_JS_URL");
     }
     Ok(script_url)
+  }
+
+  /// The `XSRF_TOKEN` of the Music page as served to a signed-in account,
+  /// which the stats pings send as their `session_token`. The anonymous
+  /// page's token is a different one that YouTube does not tie to the account.
+  pub async fn session_token(&self, auth: header::HeaderMap) -> Result<String, BootstrapError> {
+    let html = self
+      .http
+      .get("https://music.youtube.com/")
+      .header(header::USER_AGENT, &self.user_agent)
+      .header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+      .headers(auth)
+      .send()
+      .await
+      .map_err(BootstrapError::Request)?
+      .error_for_status()
+      .map_err(BootstrapError::Request)?
+      .text()
+      .await
+      .map_err(BootstrapError::Request)?;
+    Self::parse_session_token(&html)
+  }
+
+  fn parse_session_token(html: &str) -> Result<String, BootstrapError> {
+    let config = extract_config(html)?;
+    if config.get("LOGGED_IN").and_then(Value::as_bool) != Some(true) {
+      return Err(BootstrapError::MissingField("a signed-in page (LOGGED_IN)"));
+    }
+    string_field(&config, "XSRF_TOKEN")
   }
 
   /// Parses HTML previously fetched from `https://music.youtube.com/`.
@@ -301,5 +337,16 @@ mod tests {
       data.player_script_url.as_deref(),
       Some("https://www.youtube.com/s/player/a/base.js")
     );
+  }
+
+  #[test]
+  fn session_token_needs_a_signed_in_page() {
+    let page = |logged_in: bool| {
+      format!(
+        r#"<script>ytcfg.set({{"INNERTUBE_API_KEY":"k","LOGGED_IN":{logged_in},"XSRF_TOKEN":"tok"}});</script>"#
+      )
+    };
+    assert_eq!(WebBootstrapper::parse_session_token(&page(true)).unwrap(), "tok");
+    assert!(WebBootstrapper::parse_session_token(&page(false)).is_err());
   }
 }

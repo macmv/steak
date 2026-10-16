@@ -82,6 +82,9 @@ pub struct MusicClientConfig {
   /// Remaining top-level `INNERTUBE_CONTEXT` fields, such as `user` and
   /// `request`.
   pub request_context: Map<String, Value>,
+  /// The page's own `INNERTUBE_CONTEXT.client` (browser, OS, platform). Not
+  /// sent with API calls; the stats pings state it (see `stats_params`).
+  pub page_client:     Map<String, Value>,
   pub api_key:         Option<String>,
   pub user_agent:      header::HeaderValue,
   /// Cookies and authorization headers for authenticated requests.
@@ -94,6 +97,7 @@ impl Default for MusicClientConfig {
       context:         ClientContext::default(),
       client_context:  Map::new(),
       request_context: Map::new(),
+      page_client:     Map::new(),
       api_key:         None,
       user_agent:      header::HeaderValue::from_static(
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -170,6 +174,52 @@ impl MusicClient {
     let response = request.send().await?;
     debug!("Innertube {} responded with {}", endpoint.path(), response.status());
     response.error_for_status()?.json().await
+  }
+
+  /// The web client's identity as the stats pings state it (`c`, `cver`,
+  /// `cbr`, `cbrver`, `cos`, `cplatform`, `cplayer`, `hl`, `cr`).
+  pub fn stats_params(&self) -> Vec<(&'static str, String)> {
+    let client = |name: &str| self.config.page_client.get(name).and_then(Value::as_str);
+    let mut params = vec![
+      ("cbr", client("browserName")),
+      ("cbrver", client("browserVersion")),
+      ("c", Some(self.config.context.client_name.as_str())),
+      ("cver", Some(self.config.context.client_version.as_str())),
+      ("cplayer", Some("UNIPLAYER")),
+      ("cos", client("osName")),
+      ("cplatform", client("platform")),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.map(|value| (name, value.to_owned())))
+    .collect::<Vec<_>>();
+    let (hl, gl) = (&self.config.context.hl, &self.config.context.gl);
+    params.push(("hl", if hl.contains('_') { hl.clone() } else { format!("{hl}_{gl}") }));
+    params.push(("cr", gl.clone()));
+    params
+  }
+
+  /// Sends one stats ping (a URL from `PlaybackTracking::url`) as the signed-in
+  /// page does: a form `POST` carrying `session_token`.
+  pub async fn send_stats(&self, url: Url, session_token: &str) -> reqwest::Result<()> {
+    let mut request = self
+      .http
+      .post(url)
+      .header(header::USER_AGENT, &self.config.user_agent)
+      .header("X-YouTube-Client-Name", self.config.context.client_id)
+      .header("X-YouTube-Client-Version", &self.config.context.client_version)
+      .header("X-Goog-AuthUser", "0")
+      .header(header::ORIGIN, "https://music.youtube.com")
+      .header(header::REFERER, "https://music.youtube.com/")
+      .headers(self.config.headers.clone())
+      .timeout(REQUEST_TIMEOUT)
+      .form(&[("session_token", session_token)]);
+    if let Some(visitor_data) = &self.config.context.visitor_data {
+      request = request.header("X-Goog-Visitor-Id", visitor_data);
+    }
+    let response = request.send().await?;
+    debug!("stats ping responded with {}", response.status());
+    response.error_for_status()?;
+    Ok(())
   }
 
   pub async fn search(

@@ -22,6 +22,7 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::StreamExt;
+use st_api::playback::stats::{Ping, PingKind, PlaybackTracking, State};
 use st_proto::{
   catalog::{Shelf, ShelfItem, Track},
   ipc::{CellReport, Command, PlayerView, Request, Response, SessionReport, Source, Transport},
@@ -37,7 +38,7 @@ use crate::{
   client::{self, BoxError as ClientError, Subscription},
   daemon::{
     Daemon,
-    api::{AudioChunks, Backend, BoxError, Fut, OnStarted},
+    api::{AudioChunks, Backend, BoxError, Fut, OnStarted, Opened},
     machine::Batch,
     server,
   },
@@ -72,6 +73,8 @@ struct Fake {
   streams: Mutex<HashMap<String, mpsc::UnboundedSender<Chunk>>>,
   /// Every video ID that was opened, in order.
   opened:  Mutex<Vec<String>>,
+  /// Every stats ping the daemon reported, in order.
+  pings:   Mutex<Vec<Ping>>,
 }
 
 impl Fake {
@@ -93,6 +96,24 @@ impl Fake {
   }
 
   fn opened(&self) -> Vec<String> { self.opened.lock().unwrap().clone() }
+
+  fn pings(&self) -> Vec<Ping> { self.pings.lock().unwrap().clone() }
+
+  /// What a player response's tracking block holds, for any video.
+  fn tracking(video_id: &str) -> PlaybackTracking {
+    let base = |name: &str| {
+      format!(
+        "https://s.youtube.com/api/stats/{name}?docid={video_id}&ei=e&ns=yt&el=detailpage&len=183"
+      )
+    };
+    let response = serde_json::json!({"playbackTracking": {
+      "videostatsPlaybackUrl": {"baseUrl": base("playback")},
+      "videostatsWatchtimeUrl": {"baseUrl": base("watchtime")},
+      "videostatsScheduledFlushWalltimeSeconds": [10, 20],
+      "videostatsDefaultFlushIntervalSeconds": 40,
+    }});
+    PlaybackTracking::from_player(&response, 140).unwrap()
+  }
 
   fn radio_page(seed: &str, token: Option<&str>) -> Batch {
     match token {
@@ -170,7 +191,7 @@ impl Backend for Fake {
     })
   }
 
-  fn open_audio<'a>(&'a self, video_id: &'a str) -> Fut<'a, Result<AudioChunks, BoxError>> {
+  fn open_audio<'a>(&'a self, video_id: &'a str) -> Fut<'a, Result<Opened, BoxError>> {
     Box::pin(async move {
       if video_id == "broken" {
         return Err("this video is unavailable".into());
@@ -182,7 +203,17 @@ impl Backend for Fake {
       let stream = futures_util::stream::unfold(receiver, |mut receiver| async {
         receiver.recv().await.map(|chunk| (chunk, receiver))
       });
-      Ok(Box::pin(stream) as AudioChunks)
+      Ok(Opened {
+        chunks:   Box::pin(stream) as AudioChunks,
+        tracking: Some(Self::tracking(video_id)),
+      })
+    })
+  }
+
+  fn report<'a>(&'a self, _: &'a PlaybackTracking, ping: Ping) -> Fut<'a, Result<(), BoxError>> {
+    Box::pin(async move {
+      self.pings.lock().unwrap().push(ping);
+      Ok(())
     })
   }
 
@@ -516,6 +547,56 @@ async fn pause_and_resume() {
   watch.until(|view| view.transport == Transport::Paused).await;
   rig.command(Command::Resume).await;
   watch.playing("a").await;
+}
+
+/// Waits until the daemon has reported `count` pings, and returns them.
+async fn pings(rig: &Rig, count: usize) -> Vec<Ping> {
+  tokio::time::timeout(PATIENCE, async {
+    loop {
+      let pings = rig.fake.pings();
+      if pings.len() >= count {
+        return pings;
+      }
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .unwrap_or_else(|_| panic!("expected {count} pings, got {:?}", rig.fake.pings()))
+}
+
+#[tokio::test]
+async fn a_playback_is_reported_as_it_happens() {
+  let rig = Rig::start().await;
+  let mut watch = rig.subscribe().await;
+  rig.command(Command::Play { video_id: "a".into() }).await;
+  watch.playing("a").await;
+  assert_eq!(pings(&rig, 1).await[0].kind, PingKind::Playback);
+
+  tokio::time::sleep(Duration::from_millis(50)).await;
+  rig.command(Command::Pause).await;
+  let paused = &pings(&rig, 2).await[1];
+  assert_eq!(paused.kind, PingKind::Watchtime);
+  assert_eq!(paused.state, State::Paused);
+  assert!(!paused.is_final);
+  assert_eq!(paused.segments.len(), 1);
+
+  rig.command(Command::Resume).await;
+  watch.playing("a").await;
+  rig.command(Command::Stop).await;
+  let all = pings(&rig, 3).await;
+  assert_eq!(all.len(), 3);
+  assert!(all[2].is_final);
+  assert_eq!(all[2].kind, PingKind::Watchtime);
+}
+
+#[tokio::test]
+async fn a_track_left_before_it_played_is_not_reported() {
+  let rig = Rig::start().await;
+  let mut watch = rig.subscribe().await;
+  rig.command(Command::Play { video_id: "broken".into() }).await;
+  watch.until(|view| matches!(view.transport, Transport::Failed(_))).await;
+  tokio::time::sleep(Duration::from_millis(100)).await;
+  assert!(rig.fake.pings().is_empty());
 }
 
 #[tokio::test]

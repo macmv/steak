@@ -53,6 +53,7 @@ pub mod player;
 pub mod server;
 pub mod service;
 pub mod session;
+pub mod stats;
 
 use std::{
   sync::Arc,
@@ -121,7 +122,7 @@ impl Daemon {
       Request::Download { video_id, output } => {
         info!("downloading {video_id} to {}", output.display());
         let result = match self.backend.open_audio(&video_id).await {
-          Ok(audio) => self.backend.save(audio, &output).await,
+          Ok(opened) => self.backend.save(opened.chunks, &output).await,
           Err(error) => Err(error.to_string()),
         };
         match result {
